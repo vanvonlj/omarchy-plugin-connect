@@ -21,6 +21,15 @@ RestartSec=5s
 NoNewPrivileges=true
 ProtectSystem=strict
 
+# tmux keeps its server socket under /tmp/tmux-$UID, and ProtectSystem=strict
+# mounts everything except /dev, /proc and /sys read-only. Connecting to a
+# socket that already exists still works on a read-only mount, so the daemon can
+# list and attach to sessions someone else started -- but it cannot start one:
+# `tmux new-session` fails to create its socket and *exits 0 anyway*, so the
+# daemon reports success and nothing appears. Sessions created from the phone
+# vanish silently. /tmp must be writable.
+ReadWritePaths=/tmp
+
 # PrivateTmp is deliberately NOT set, and this is load-bearing rather than an
 # oversight. tmux's server socket lives at /tmp/tmux-$UID/default, so a private
 # /tmp hides every session on the machine: the daemon starts cleanly, serves the

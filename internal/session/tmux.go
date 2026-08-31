@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -72,6 +73,15 @@ func List(ctx context.Context) ([]Session, error) {
 		s, err := parseSession(line)
 		if err != nil {
 			return nil, err
+		}
+		// Phone views are ours, not the user's. Hidden from the list, and
+		// collected here if one outlived the daemon that made it -- a stray
+		// view holds a tmux client and keeps voting on window size.
+		if IsView(s.Name) {
+			if !s.Attached {
+				_, _ = run(ctx, "kill-session", "-t", s.Name)
+			}
+			continue
 		}
 		sessions = append(sessions, s)
 	}
@@ -185,4 +195,83 @@ func unixOrZero(s string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(n, 0)
+}
+
+// Create starts a new tmux session.
+//
+// This exists so that nobody has to know tmux to get a session going. The name
+// is validated rather than passed through: tmux treats "." and ":" as target
+// separators, so a name containing them refers to something other than itself
+// and produces errors that make no sense to whoever typed it.
+func Create(ctx context.Context, name, dir string) error {
+	if err := ValidName(name); err != nil {
+		return err
+	}
+	if dir == "" {
+		dir = os.Getenv("HOME")
+	}
+
+	exists, err := Exists(ctx, name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("a session named %q already exists", name)
+	}
+
+	if _, err := run(ctx, "new-session", "-d", "-s", name, "-c", dir); err != nil {
+		return err
+	}
+
+	// tmux can fail to start its server and still exit 0 -- it does exactly
+	// that when it cannot create its socket, which is what a sandboxed unit
+	// with a read-only /tmp produces. Without this check the daemon reports a
+	// session it did not create and the caller is left staring at an empty
+	// list, with a success in the log.
+	created, err := Exists(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !created {
+		return fmt.Errorf("tmux reported success but no session %q exists; "+
+			"the daemon may not be able to write to /tmp", name)
+	}
+	return nil
+}
+
+// Kill ends a session and everything running in it.
+func Kill(ctx context.Context, name string) error {
+	if IsView(name) {
+		return errors.New("that is an internal view, not a session")
+	}
+	exists, err := Exists(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("no tmux session named %q", name)
+	}
+
+	// Take the view with it, or tmux keeps the group alive through the view and
+	// the session appears to survive being killed.
+	_, _ = run(ctx, "kill-session", "-t", ViewName(name))
+	_, err = run(ctx, "kill-session", "-t", name)
+	return err
+}
+
+// ValidName rejects names tmux cannot address unambiguously.
+func ValidName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("a session needs a name")
+	case len(name) > 64:
+		return errors.New("that name is too long")
+	case strings.ContainsAny(name, ".:"):
+		return errors.New("a session name cannot contain '.' or ':'")
+	case strings.TrimSpace(name) != name:
+		return errors.New("a session name cannot start or end with a space")
+	case IsView(name):
+		return errors.New("that name is reserved")
+	}
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/creack/pty"
 )
@@ -38,12 +39,39 @@ const (
 	ModeMirror Mode = "mirror"
 )
 
+// viewSuffix marks the throwaway session created for a phone.
+//
+// Attaching to the real session directly means inheriting its options, and the
+// two that matter most cannot be changed without changing them for the desktop
+// too: the status bar, which is the single loudest "you are looking at tmux"
+// signal, and mouse mode, without which there is no way to scroll on a
+// touchscreen at all.
+//
+// A grouped session shares the same windows -- the same panes, the same running
+// agent -- while keeping its own options and its own current window. So the
+// phone gets a clean view of exactly what the desktop is showing.
+const viewSuffix = "~phone"
+
 // Attach is a live connection to a tmux session, backed by a PTY.
 type Attach struct {
 	pty  *os.File
 	cmd  *exec.Cmd
 	name string
+	once sync.Once
+
+	// view is the throwaway grouped session, killed on Close. Empty when
+	// attaching directly.
+	view string
 }
+
+// ViewName returns the phone-view session name for a target.
+func ViewName(target string) string { return target + viewSuffix }
+
+// IsView reports whether a session is one of our throwaway phone views. The
+// listing hides these: they are an implementation detail, and showing someone a
+// second copy of their own session called "work~phone" is a good way to make
+// them think something is broken.
+func IsView(name string) bool { return strings.HasSuffix(name, viewSuffix) }
 
 // Open attaches to an existing tmux session.
 //
@@ -65,9 +93,19 @@ func Open(ctx context.Context, name string, size Size, mode Mode, writable bool)
 
 	flags := clientFlags(mode, writable)
 
+	// Build the phone's own view of the session. A failure here is not fatal:
+	// attaching directly still works, it just looks like tmux.
+	view := ViewName(name)
+	target := name
+	if err := createView(ctx, name, view); err == nil {
+		target = view
+	} else {
+		view = ""
+	}
+
 	// -t targets an existing session and never creates one. new-session -A
 	// would be friendlier for a typo and much worse for a shared machine.
-	args := []string{"attach-session", "-t", name}
+	args := []string{"attach-session", "-t", target}
 	if len(flags) > 0 {
 		args = append(args, "-f", strings.Join(flags, ","))
 	}
@@ -92,7 +130,39 @@ func Open(ctx context.Context, name string, size Size, mode Mode, writable bool)
 		return nil, fmt.Errorf("attaching to %q: %w", name, err)
 	}
 
-	return &Attach{pty: f, cmd: cmd, name: name}, nil
+	return &Attach{pty: f, cmd: cmd, name: name, view: view}, nil
+}
+
+// createView makes the grouped session the phone attaches to.
+//
+// destroy-unattached would be the obvious way to guarantee cleanup, and it
+// cannot be used here: setting it on a session that has no client yet destroys
+// that session immediately, before anything can attach. Cleanup is therefore
+// Close, plus the sweep in List for views that outlived their daemon.
+func createView(ctx context.Context, target, view string) error {
+	// Kill any stale view first. One can survive a daemon that was killed
+	// rather than shut down, and attaching to it would give the phone whatever
+	// window that dead session was last looking at.
+	_, _ = run(ctx, "kill-session", "-t", view)
+
+	if _, err := run(ctx, "new-session", "-d", "-t", target, "-s", view); err != nil {
+		return err
+	}
+
+	// Options are set on the view only, so the desktop keeps its own. Errors
+	// are ignored individually: a view with a status bar is worse-looking, not
+	// broken, and is not worth failing an attach over.
+	for _, opt := range [][]string{
+		// The status bar is tmux's most recognisable feature and the least
+		// useful on a four-inch screen.
+		{"status", "off"},
+		// Without mouse mode there is no scrolling on a touchscreen at all --
+		// history would be reachable only through copy-mode key chords.
+		{"mouse", "on"},
+	} {
+		_, _ = run(ctx, append([]string{"set-option", "-t", view}, opt...)...)
+	}
+	return nil
 }
 
 func clientFlags(mode Mode, writable bool) []string {
@@ -123,12 +193,21 @@ func (a *Attach) Resize(size Size) error {
 // Close detaches this client. The tmux session keeps running: detaching is the
 // normal end of a connection here, not a teardown.
 func (a *Attach) Close() error {
-	err := a.pty.Close()
-	if a.cmd.Process != nil {
-		a.cmd.Process.Kill()
-	}
-	// Reap the child so a phone reconnecting through a flaky network does not
-	// accumulate zombie tmux clients.
-	a.cmd.Wait()
+	// Idempotent: the handler defers this, and the cancel path calls it to
+	// unblock a PTY read. Both must be safe.
+	var err error
+	a.once.Do(func() {
+		err = a.pty.Close()
+		if a.cmd.Process != nil {
+			a.cmd.Process.Kill()
+		}
+		if a.view != "" {
+			// The view is disposable by design; the session it mirrors is not.
+			_, _ = run(context.Background(), "kill-session", "-t", a.view)
+		}
+		// Reap the child so a phone reconnecting through a flaky network does
+		// not accumulate zombie tmux clients.
+		a.cmd.Wait()
+	})
 	return err
 }

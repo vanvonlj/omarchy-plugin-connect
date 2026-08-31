@@ -116,7 +116,18 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	go s.pumpInput(ctx, cancel, conn, att)
 	go s.watchCapability(ctx, cancel, conn, dev.ID, writable)
 	go s.keepalive(ctx, cancel, conn, name)
-	s.pumpOutput(ctx, cancel, conn, att)
+	go s.pumpOutput(ctx, cancel, conn, att)
+
+	// Wait on the context, not on pumpOutput.
+	//
+	// pumpOutput blocks in a read on the PTY, and a blocking read does not
+	// notice a cancelled context -- it returns when the terminal next produces
+	// output, which on an idle session can be never. Running it here meant the
+	// handler survived the client's disconnect, so the tmux client stayed
+	// attached and its phone view was never collected. Every reconnect while
+	// roaming then added another one. The deferred Close below closes the PTY,
+	// which is what actually unblocks that read.
+	<-ctx.Done()
 
 	s.log.Info("detached", "session", name)
 }
@@ -256,4 +267,49 @@ func (s *Server) keepalive(ctx context.Context, cancel context.CancelFunc, conn 
 			}
 		}
 	}
+}
+
+type createRequest struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// handleCreateSession starts a session without anyone needing to know tmux.
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWrite(w, r) {
+		return
+	}
+
+	var req createRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if err := session.Create(r.Context(), req.Name, req.Path); err != nil {
+		// The message goes to the client here, unlike admission failures: this
+		// is the caller's own name being rejected, and "a session name cannot
+		// contain ':'" is only useful if they see it.
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.log.Info("session created", "session", req.Name, "device", deviceFrom(r.Context()).Name)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// handleKillSession ends a session and everything in it.
+func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWrite(w, r) {
+		return
+	}
+
+	name := r.PathValue("name")
+	if err := session.Kill(r.Context(), name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.log.Info("session killed", "session", name, "device", deviceFrom(r.Context()).Name)
+	w.WriteHeader(http.StatusNoContent)
 }

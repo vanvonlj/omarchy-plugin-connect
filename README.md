@@ -258,6 +258,38 @@ terminal means a bug in the daemon's message handling cannot promote a
 read-only device to a writable one. There is a test that removes the flag and
 confirms the guarantee breaks, so the test cannot quietly stop meaning anything.
 
+## Not needing to know tmux
+
+tmux is the engine, not the interface. Nobody should have to learn it to read
+what an agent is asking.
+
+**The phone attaches to its own view of the session**, not to the session
+itself: a grouped tmux session that shares the same windows and panes — the same
+running agent — while keeping its own options. That view has the status bar off,
+so the screen looks like a terminal rather than like tmux, and mouse mode on, so
+history scrolls under a thumb instead of through copy-mode key chords. It is
+created on attach and destroyed on detach, and never appears in the session
+list. The desktop's own session is untouched.
+
+**Everything else is a button.** Starting a session, ending one, interrupting
+what is running, clearing the screen — each of these is otherwise a tmux command
+or a key chord:
+
+| Instead of | You get |
+|---|---|
+| `tmux new -s name -c dir` | **+** and a name field |
+| `tmux kill-session -t name` | **End this session**, behind a confirm |
+| `Ctrl-C` | **Stop what's running** |
+| `Ctrl-b [` then arrows, then `q` | scrolling, with a thumb |
+| `Ctrl-b d` | the back arrow |
+
+The key bar keeps the four keys a phone keyboard genuinely lacks — `esc`, `tab`,
+`ctrl` as a sticky modifier, and arrows — plus `enter`, because it is the one
+key pressed most and the smallest on a phone.
+
+A read-only device is shown none of these controls rather than being allowed to
+press them and collect an error.
+
 ## Layout
 
 ```

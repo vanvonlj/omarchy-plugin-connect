@@ -16,11 +16,26 @@
 <main id="list-view">
   <header>
     <h1>Sessions</h1>
+    <button id="new-session" aria-label="New session">+</button>
     <button id="refresh" aria-label="Refresh">↻</button>
   </header>
   <p id="capability" hidden></p>
   <div id="sessions" role="list"></div>
   <p id="list-status"></p>
+
+  <!-- Creating a session is the one thing that otherwise needs a keyboard and
+       a tmux command, so it gets a form rather than an explanation. -->
+  <form id="new-form" hidden>
+    <label for="new-name">Name</label>
+    <input id="new-name" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="my-project">
+    <label for="new-path">Folder <span class="hint">optional</span></label>
+    <input id="new-path" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="~">
+    <div class="form-actions">
+      <button type="button" id="new-cancel" class="secondary">Cancel</button>
+      <button type="submit" id="new-create">Start session</button>
+    </div>
+    <p id="new-error"></p>
+  </form>
 </main>
 
 <main id="term-view" hidden>
@@ -28,13 +43,24 @@
     <button id="back" aria-label="Back to sessions">‹</button>
     <h1 id="term-name"></h1>
     <span id="term-status" aria-live="polite"></span>
+    <button id="term-menu" aria-label="Session actions">⋯</button>
   </header>
+
+  <!-- Everything here is a tmux operation someone would otherwise need a key
+       chord for. -->
+  <div id="menu" hidden>
+    <button data-action="interrupt">Stop what's running <span>Ctrl-C</span></button>
+    <button data-action="clear">Clear the screen</button>
+    <button data-action="kill" class="danger">End this session</button>
+    <button data-action="close-menu" class="secondary">Cancel</button>
+  </div>
 
   <div id="terminal"></div>
 
   <!-- The reason phone terminals are miserable is that none of these keys are
        on a phone keyboard. They are not a nicety. -->
   <nav id="keys" aria-label="Terminal keys">
+    <button data-seq="\r" class="wide">enter</button>
     <button data-seq="\x1b">esc</button>
     <button data-seq="\t">tab</button>
     <button id="ctrl" data-modifier="ctrl">ctrl</button>
@@ -42,7 +68,6 @@
     <button data-seq="\x1b[B">↓</button>
     <button data-seq="\x1b[D">←</button>
     <button data-seq="\x1b[C">→</button>
-    <button data-seq="\x03">^C</button>
   </nav>
 </main>
 

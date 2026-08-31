@@ -214,3 +214,124 @@ func clip(s string) string {
 	}
 	return s
 }
+
+// The phone attaches to a throwaway grouped view, not to the session itself.
+// The view must never appear in the list, and killing it must leave the real
+// session and everything running in it alone.
+func TestPhoneViewIsHiddenAndDisposable(t *testing.T) {
+	isolate(t)
+	newSession(t, "work")
+
+	att, err := Open(context.Background(), "work", Size{Cols: 80, Rows: 24}, ModeFit, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	rec := record(att)
+	if first := rec.settle(750 * time.Millisecond); len(first) == 0 {
+		t.Fatal("attach produced no output")
+	}
+
+	// The view exists in tmux while attached...
+	raw, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		t.Fatalf("list-sessions: %v", err)
+	}
+	if !strings.Contains(string(raw), ViewName("work")) {
+		t.Fatalf("no phone view was created; tmux has: %q", raw)
+	}
+
+	// ...but the API never shows it.
+	listed, err := List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, s := range listed {
+		if IsView(s.Name) {
+			t.Errorf("a phone view leaked into the session list: %q", s.Name)
+		}
+	}
+	if len(listed) != 1 || listed[0].Name != "work" {
+		t.Fatalf("got %d sessions, want just \"work\": %+v", len(listed), listed)
+	}
+
+	att.Close()
+	time.Sleep(500 * time.Millisecond)
+
+	// The view is gone, the real session is not.
+	raw, _ = exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if strings.Contains(string(raw), ViewName("work")) {
+		t.Errorf("the phone view outlived the attach: %q", raw)
+	}
+	if !strings.Contains(string(raw), "work") {
+		t.Fatalf("closing the phone view killed the real session; tmux has: %q", raw)
+	}
+}
+
+func TestCreateAndKill(t *testing.T) {
+	isolate(t)
+	newSession(t, "anchor") // keeps the server alive between the two calls
+
+	if err := Create(context.Background(), "made-by-api", t.TempDir()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	ok, _ := Exists(context.Background(), "made-by-api")
+	if !ok {
+		t.Fatal("Create did not produce a session")
+	}
+
+	// Creating the same name twice must be an error, not a silent attach to
+	// someone else's session.
+	if err := Create(context.Background(), "made-by-api", ""); err == nil {
+		t.Fatal("Create accepted a duplicate name")
+	}
+
+	if err := Kill(context.Background(), "made-by-api"); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	ok, _ = Exists(context.Background(), "made-by-api")
+	if ok {
+		t.Fatal("Kill left the session running")
+	}
+	if err := Kill(context.Background(), "made-by-api"); err == nil {
+		t.Fatal("Kill of a missing session should be an error")
+	}
+}
+
+func TestValidName(t *testing.T) {
+	bad := []string{"", "  ", " leading", "trailing ", "has.dot", "has:colon", "x~phone", strings.Repeat("a", 65)}
+	for _, name := range bad {
+		if err := ValidName(name); err == nil {
+			t.Errorf("ValidName(%q) accepted a name tmux cannot address", name)
+		}
+	}
+	for _, name := range []string{"work", "my-project", "chem check", "agent_1"} {
+		if err := ValidName(name); err != nil {
+			t.Errorf("ValidName(%q) rejected a reasonable name: %v", name, err)
+		}
+	}
+}
+
+// Killing a session must take its view with it. tmux keeps a session group
+// alive through any member, so leaving the view behind makes the session look
+// like it survived being killed.
+func TestKillRemovesTheView(t *testing.T) {
+	isolate(t)
+	newSession(t, "anchor")
+	newSession(t, "doomed")
+
+	att, err := Open(context.Background(), "doomed", Size{Cols: 80, Rows: 24}, ModeFit, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	record(att).settle(500 * time.Millisecond)
+
+	if err := Kill(context.Background(), "doomed"); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	att.Close()
+
+	raw, _ := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if strings.Contains(string(raw), "doomed") {
+		t.Fatalf("the session survived being killed: %q", raw)
+	}
+}

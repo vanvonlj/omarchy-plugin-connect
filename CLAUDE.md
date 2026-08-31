@@ -71,6 +71,12 @@ omarchy plugin validate .
 - **Testing tier 2 with curl from this machine does not exercise the firewall.**
   Traffic to a local address stays on loopback, which ufw allows by default. A
   green curl says nothing about whether a phone can reach it.
+- **`ProtectSystem=strict` makes /tmp read-only, and `tmux new-session` exits 0
+  anyway.** Connecting to an existing socket still works, so listing and
+  attaching look fine while *creating* a session silently does nothing: the
+  daemon logs success and the session never appears. The unit needs
+  `ReadWritePaths=/tmp`, and `session.Create` verifies the session exists rather
+  than trusting the exit code.
 - **Never set `PrivateTmp=` on the unit.** tmux's server socket is at
   `/tmp/tmux-$UID/default`, so a private `/tmp` hides every session on the
   machine. The failure is silent and deeply misleading: the daemon starts, TLS
@@ -86,6 +92,12 @@ omarchy plugin validate .
   write it by shelling out to `omarchy-connect`, never by parsing or writing
   the file itself. Bar-widget settings in `shell.json` are for presentation
   only (badge visibility, refresh interval).
+- **Do not block a request handler on a PTY read.** A blocking read ignores a
+  cancelled context and returns only when the terminal next produces output,
+  which on an idle session is never. `handleAttach` waits on `<-ctx.Done()` and
+  lets its deferred `Close` unblock the reader; running the output pump inline
+  instead left a tmux client attached after every disconnect, and roaming then
+  stacked one up per reconnect.
 - **Agent state detection is a heuristic and is allowed to be wrong.** Never
   gate a capability on it. The terminal is ground truth; the badge is a hint.
 - **Deleting a tailnet device does not revoke it.** Tailscale keeps vouching for

@@ -71,7 +71,15 @@ async function loadMe() {
 // find out.
 function renderCapability() {
   const banner = document.getElementById('capability');
-  if (!me || me.canWrite) {
+  const canWrite = !me || me.canWrite;
+
+  // Hide the controls a read-only device cannot use rather than letting it
+  // press them and collect an error.
+  document.getElementById('new-session').hidden = !canWrite;
+  document.getElementById('term-menu').hidden = !canWrite;
+  document.getElementById('keys').hidden = !canWrite;
+
+  if (canWrite) {
     banner.hidden = true;
     return;
   }
@@ -140,9 +148,11 @@ function sessionRow(s) {
 
   const meta = document.createElement('div');
   meta.className = 'session-meta';
+  // The tmux window count used to be here. It means nothing to someone who does
+  // not use tmux, and where the session is and when it last did something are
+  // the two things that actually identify it.
   const bits = [];
   if (s.path) bits.push(s.path.replace(/^\/home\/[^/]+/, '~'));
-  bits.push(`${s.windows} window${s.windows === 1 ? '' : 's'}`);
   if (s.activity) bits.push(relativeTime(s.activity));
   meta.textContent = bits.join(' · ');
 
@@ -342,8 +352,10 @@ function detach() {
   fit = null;
   setCtrl(false);
 
+  document.getElementById('menu').hidden = true;
   termView.hidden = true;
   listView.hidden = false;
+  showNewForm(false);
   loadSessions();
 }
 
@@ -385,6 +397,92 @@ function wrapCtrl(data) {
   }
   return data;
 }
+
+// ---------- creating and ending sessions ----------
+
+const newForm = document.getElementById('new-form');
+const newName = document.getElementById('new-name');
+const newPath = document.getElementById('new-path');
+const newError = document.getElementById('new-error');
+
+function showNewForm(show) {
+  newForm.hidden = !show;
+  newError.textContent = '';
+  if (show) {
+    newName.value = '';
+    newPath.value = '';
+    newName.focus();
+  }
+}
+
+document.getElementById('new-session').addEventListener('click', () => {
+  if (me && !me.canWrite) {
+    listStatus.textContent = 'This device is read-only. Promote it on the desktop to start sessions.';
+    return;
+  }
+  showNewForm(newForm.hidden);
+});
+
+document.getElementById('new-cancel').addEventListener('click', () => showNewForm(false));
+
+newForm.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const name = newName.value.trim();
+  if (!name) { newError.textContent = 'Give it a name.'; return; }
+
+  try {
+    const res = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, path: newPath.value.trim() }),
+    });
+    if (!res.ok) {
+      // The daemon's message is the useful one here -- it knows why tmux
+      // refused the name.
+      newError.textContent = (await res.text()).trim() || `HTTP ${res.status}`;
+      return;
+    }
+  } catch (err) {
+    newError.textContent = err.message;
+    return;
+  }
+
+  showNewForm(false);
+  await loadSessions();
+  attach(name);
+});
+
+const menu = document.getElementById('menu');
+
+document.getElementById('term-menu').addEventListener('click', () => {
+  menu.hidden = !menu.hidden;
+});
+
+menu.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  menu.hidden = true;
+
+  if (action === 'interrupt') { sendRaw('\x03'); term && term.focus(); return; }
+
+  // Ctrl-L rather than clearing xterm.js: the shell redraws its prompt, so the
+  // screen matches what the desktop sees instead of only looking cleared here.
+  if (action === 'clear') { sendRaw('\x0c'); term && term.focus(); return; }
+
+  if (action === 'kill') {
+    if (!confirm(`End "${currentSession}"? Anything running in it stops.`)) return;
+    const name = currentSession;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (!res.ok) { setStatus((await res.text()).trim() || 'could not end session'); return; }
+    } catch (err) {
+      setStatus(err.message);
+      return;
+    }
+    detach();
+  }
+});
 
 document.getElementById('back').addEventListener('click', detach);
 document.getElementById('refresh').addEventListener('click', loadSessions);

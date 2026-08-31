@@ -49,6 +49,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
+	mux.HandleFunc("DELETE /api/sessions/{name}", s.handleKillSession)
 	mux.HandleFunc("GET /api/sessions/{name}/attach", s.handleAttach)
 	mux.HandleFunc("GET /api/me", s.handleMe)
 	mux.HandleFunc("POST /api/pair", s.handlePair)
