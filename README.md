@@ -20,10 +20,11 @@ when there is one, and over Tailscale when there is not.
                 lucas.connect             ← Omarchy shell plugin (bar widget + panel)
 ```
 
-> **Status: pre-implementation.** This repo currently holds the design, the
-> conventions, and nothing else. Nothing below is running yet — every command
-> in this README is the interface being built toward, not one you can type
-> today. See [Roadmap](#roadmap).
+> **Status: step 1 of 7 done.** The daemon serves over the tailnet with real
+> TLS and refuses anyone Tailscale will not vouch for — verified end to end on
+> a live tailnet, under systemd, with a publicly-verified certificate chain.
+> There are no sessions yet: the only route is `/healthz`. `serve` and `status`
+> work today; `pair` and `devices` are step 3. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -184,11 +185,18 @@ daemon can reach the LocalAPI without root.
 # 1. the daemon
 git clone https://github.com/vanvonlj/omarchy-plugin-connect.git
 cd omarchy-plugin-connect
-make install                 # builds and installs omarchy-connect + the user unit
+make install                            # builds, installs the binary + user unit
+systemctl --user enable --now omarchy-connect
 
-# 2. the shell plugin
+# 2. the shell plugin (not built yet — roadmap step 4)
 omarchy plugin add https://github.com/vanvonlj/omarchy-plugin-connect.git --enable
 ```
+
+`make install` deliberately targets `~/.local` and a systemd **user** unit, never
+root. The Tailscale operator grant is per-user, and it is what makes `WhoIs` and
+`GetCertificate` reachable over the LocalAPI socket — so running as the user is
+what makes the daemon work, not a compromise. It also declines to give a
+shell-adjacent service privileges it has no use for.
 
 `omarchy plugin add` deliberately never runs code, install hooks, or sudo — so
 the two steps stay two steps. Installing the plugin alone gets you a bar widget
@@ -227,7 +235,7 @@ never disagree.
 
 ## Roadmap
 
-1. **Daemon skeleton** — config, `serve`, tailnet listener with `tailscale cert`, health endpoint
+1. ~~**Daemon skeleton** — config, `serve`, tailnet listener with LocalAPI certs, health endpoint~~ ✅
 2. **Sessions** — tmux enumeration, websocket PTY attach, `xterm.js` client
 3. **Identity** — Tailscale WhoIs admission, LAN pairing + device tokens, capabilities
 4. **Plugin** — bar widget, settings panel, pairing QR, device management

@@ -1,0 +1,39 @@
+[Unit]
+Description=omarchy-connect: remote access to tmux and agent sessions
+Documentation=https://github.com/vanvonlj/omarchy-plugin-connect
+
+# Deliberately not ordered After=tailscaled.service: this is a *user* unit, and
+# user units cannot order against system units. The daemon instead exits with a
+# clear precondition error when tailscaled is not up yet, and Restart below
+# turns that into a retry. Boot ordering is therefore handled by the restart
+# loop rather than by a dependency that systemd would silently ignore.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-connect serve
+Restart=on-failure
+RestartSec=5s
+
+# The unit runs as the user, without root, because the Tailscale operator grant
+# is per-user: that is what makes WhoIs and GetCertificate reachable over the
+# LocalAPI socket. Running this as root would need a different grant and would
+# hand a shell-adjacent service privileges it has no use for.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+
+# Creates ~/.config/omarchy/connect (0700) and makes it writable under
+# ProtectSystem=strict. This replaces a ReadWritePaths= for the same directory,
+# which fails the whole unit with 226/NAMESPACE on a first run, before anything
+# has created it -- exactly the run where a new user finds out.
+ConfigurationDirectory=omarchy/connect
+ConfigurationDirectoryMode=0700
+
+# ProtectHome is deliberately absent rather than set. The daemon's whole job is
+# reaching into $HOME -- tmux sockets, agent state, the config -- so there is no
+# useful setting here. (`read-write` is not a valid value; systemd parses it as
+# an error, warns, and carries on with no protection at all, which looks like
+# hardening in the file while providing none.)
+
+[Install]
+WantedBy=default.target
