@@ -24,14 +24,14 @@ Panel {
 
   readonly property var devices: service.devices
   readonly property bool pairing: service.qrSize > 0
-  readonly property bool healthy: service.installed && service.daemonRunning && service.problem === ""
+  readonly property bool healthy: service.installed && service.serving && service.problem === ""
 
   // The icon earns full brightness only when the daemon is actually serving.
   // A dim plug means "nothing is listening", which is the one thing worth
   // reading off the bar without opening anything.
   readonly property color barIconColor: {
     if (!service.installed || service.problem !== "") return urgent
-    return service.daemonRunning ? barForeground : Qt.darker(barForeground, 1.7)
+    return service.serving ? barForeground : Qt.darker(barForeground, 1.7)
   }
 
   function selectedDevice() {
@@ -92,7 +92,7 @@ Panel {
     tooltipText: {
       if (!service.installed) return "Connect: daemon not installed"
       if (service.problem !== "") return "Connect: " + service.problem
-      if (!service.daemonRunning) return "Connect: daemon stopped"
+      if (!service.serving) return "Connect: nothing listening"
       return service.url !== "" ? "Connect: " + service.url : "Connect"
     }
     iconComponent: Component {
@@ -193,6 +193,31 @@ Panel {
             }
           }
 
+          // ---------- binary out of date ----------
+
+          Column {
+            visible: service.binaryOutdated
+            width: parent.width
+            spacing: Style.space(4)
+
+            Text {
+              width: parent.width
+              text: "The installed daemon is older than this plugin."
+              color: root.urgent
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              width: parent.width
+              text: "Updating the plugin does not rebuild the binary. From the plugin checkout:\n    make install"
+              color: root.dim
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
           // ---------- status ----------
 
           Column {
@@ -215,7 +240,8 @@ Panel {
               Text {
                 text: {
                   if (service.problem !== "") return "Not reachable"
-                  return service.daemonRunning ? "Serving" : "Stopped"
+                  if (service.serving) return service.daemonRunning ? "Serving" : "Serving (started by hand)"
+                  return "Stopped"
                 }
                 color: root.foreground
                 font.family: root.fontFamily

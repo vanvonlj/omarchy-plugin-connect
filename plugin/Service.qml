@@ -14,7 +14,8 @@ Item {
   property var settings: ({})
 
   property bool installed: true
-  property bool daemonRunning: false
+  property bool daemonRunning: false   // the systemd unit, which drives Start/Stop
+  property bool serving: false         // something is actually listening
   property bool checkedInstall: false
 
   property string node: ""
@@ -26,6 +27,14 @@ Item {
   property var devices: []
   property string lastError: ""
   property string actionStatus: ""
+
+  // True when the installed binary is older than this plugin.
+  //
+  // `omarchy plugin update` refreshes the QML and leaves the daemon binary
+  // alone, so the panel can be a version ahead of the CLI it drives. That
+  // surfaces as an unknown-subcommand error, which says nothing about the
+  // actual problem or its one-line fix.
+  property bool binaryOutdated: false
 
   // Pairing state. qrSize of 0 means "nothing to draw", which the panel reads
   // rather than tracking a separate flag.
@@ -202,6 +211,7 @@ Item {
       root.url = String(payload.url || "")
       root.certsAvailable = payload.certsAvailable === true
       root.port = parseInt(payload.port, 10) || 0
+      root.serving = payload.serving === true
       root.problem = String(payload.problem || "")
     }
   }
@@ -214,9 +224,17 @@ Item {
     stderr: StdioCollector { id: devicesErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.lastError = String(devicesErr.text || "").trim().split("\n")[0] || "devices exited " + exitCode
+        var err = String(devicesErr.text || "").trim().split("\n")[0]
+        if (err.indexOf("unknown command") !== -1) {
+          root.binaryOutdated = true
+          root.lastError = ""
+          return
+        }
+        root.binaryOutdated = false
+        root.lastError = err || "devices exited " + exitCode
         return
       }
+      root.binaryOutdated = false
       try {
         root.devices = Model.buildDevices(JSON.parse(String(devicesOut.text || "[]")))
         root.lastError = ""

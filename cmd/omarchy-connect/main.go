@@ -11,9 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/config"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/server"
@@ -111,6 +114,7 @@ func serve(args []string) error {
 
 type statusReport struct {
 	Version        string   `json:"version"`
+	Serving        bool     `json:"serving"`
 	Node           string   `json:"node"`
 	URL            string   `json:"url"`
 	Addrs          []string `json:"addrs"`
@@ -154,6 +158,7 @@ func status(args []string) error {
 		for _, a := range tn.Addrs {
 			report.Addrs = append(report.Addrs, a.String())
 		}
+		report.Serving = serving(tn, report.Port)
 	}
 
 	if *asJSON {
@@ -172,6 +177,26 @@ func status(args []string) error {
 	return nil
 }
 
+// serving reports whether anything is actually accepting connections on the
+// listener port.
+//
+// The obvious check -- ask systemd whether the unit is active -- answers a
+// different question, and answers it wrongly for a daemon started by hand from
+// a terminal. A panel that says "Stopped" while a phone is happily attached is
+// worse than no status at all.
+func serving(tn *transport.Tailnet, port int) bool {
+	if port == 0 || len(tn.Addrs) == 0 {
+		return false
+	}
+	addr := net.JoinHostPort(tn.Addrs[0].String(), strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 func printStatus(r statusReport, probeErr error) {
 	fmt.Printf("omarchy-connect %s\n\n", r.Version)
 
@@ -180,6 +205,7 @@ func printStatus(r statusReport, probeErr error) {
 		return
 	}
 
+	fmt.Printf("  serving    %s\n", servingWord(r.Serving))
 	fmt.Printf("  node       %s\n", r.Node)
 	fmt.Printf("  url        %s\n", r.URL)
 	fmt.Printf("  addrs      %v\n", r.Addrs)
@@ -200,6 +226,13 @@ func printStatus(r statusReport, probeErr error) {
 	if r.Problem != "" {
 		fmt.Printf("\n  problem    %s\n", r.Problem)
 	}
+}
+
+func servingWord(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no - nothing is listening"
 }
 
 func enabledWord(b bool) string {

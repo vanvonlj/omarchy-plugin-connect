@@ -87,13 +87,24 @@ omarchy plugin validate .
   aborted Quickshell. It restarted itself, so the desktop recovered, but this is
   an upstream Omarchy fault worth knowing about before rescanning someone's live
   session -- especially while the machine is idle or locking.
+- **Only `omarchy-restart-shell` actually reloads changed QML.** This cost real
+  time: `rescanPlugins` returns 0, `omarchy plugin disable` + `enable` both
+  succeed, and the widget keeps running its cached component. The tell is a
+  panel that renders old fields correctly while a newly added one stays at its
+  default -- which reads exactly like a logic bug in the new code. Confirm the
+  CLI output first (`omarchy-connect status --json`), and if the data is right,
+  suspect stale QML before rewriting anything.
 - **`QS_DISABLE_FILE_WATCHER=1` is set in this session**, so saving a plugin
-  file does *not* hot-reload it despite what the shell README says. `rescanPlugins`
-  is the only reload path, which is unfortunate given the point above.
+  file does *not* hot-reload it despite what the shell README says.
 - **`grim` blocks forever when the display is asleep** (`hyprctl monitors -j`
-  → `dpmsStatus: false`) and also while a panel holds a Wayland focus grab. Both
-  look identical to a hung screenshot. Check DPMS before concluding anything is
-  broken, and never wake the user's display to take one.
+  → `dpmsStatus: false`). It does *not* block on a panel's focus grab -- an open
+  panel screenshots fine once the display is awake. Check DPMS before concluding
+  a screenshot is hung, and never wake the user's display to take one.
+- **The plugin drives the installed binary, not the repo one.** `omarchy plugin
+  update` refreshes the QML and leaves `~/.local/bin/omarchy-connect` alone, so
+  the panel can be a version ahead of the CLI it shells out to. The panel now
+  detects this and says so; keep that path working, and re-run `make install`
+  after adding a subcommand or the panel will hit it before you do.
 - **Verify a widget rendered, not just that it loaded.** A bar widget with no
   `implicitWidth`/`implicitHeight` lays out at 0x0: the plugin loads, its IPC
   answers, and nothing appears. `hyprctl layers -j` showing a real surface plus
