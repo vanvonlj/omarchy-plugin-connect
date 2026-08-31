@@ -14,6 +14,7 @@ import (
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/auth"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/config"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/transport"
+	"github.com/vanvonlj/omarchy-plugin-connect/internal/webui"
 )
 
 // Server serves the daemon over the tailnet.
@@ -33,6 +34,9 @@ func New(tn *transport.Tailnet, cfg config.Config, log *slog.Logger, version str
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
+	mux.HandleFunc("GET /api/sessions/{name}/attach", s.handleAttach)
+	mux.Handle("GET /", webui.Handler())
 	return s.admitTailnet(mux)
 }
 

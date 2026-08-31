@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover so the key bar can sit above the home indicator rather
+     than under it; user-scalable=no because pinch-zoom on a terminal is a
+     misfeature that fires constantly while typing. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>omarchy connect</title>
+<link rel="stylesheet" href="xterm.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main id="list-view">
+  <header>
+    <h1>Sessions</h1>
+    <button id="refresh" aria-label="Refresh">↻</button>
+  </header>
+  <div id="sessions" role="list"></div>
+  <p id="list-status"></p>
+</main>
+
+<main id="term-view" hidden>
+  <header>
+    <button id="back" aria-label="Back to sessions">‹</button>
+    <h1 id="term-name"></h1>
+    <span id="term-status" aria-live="polite"></span>
+  </header>
+
+  <div id="terminal"></div>
+
+  <!-- The reason phone terminals are miserable is that none of these keys are
+       on a phone keyboard. They are not a nicety. -->
+  <nav id="keys" aria-label="Terminal keys">
+    <button data-seq="\x1b">esc</button>
+    <button data-seq="\t">tab</button>
+    <button id="ctrl" data-modifier="ctrl">ctrl</button>
+    <button data-seq="\x1b[A">↑</button>
+    <button data-seq="\x1b[B">↓</button>
+    <button data-seq="\x1b[D">←</button>
+    <button data-seq="\x1b[C">→</button>
+    <button data-seq="\x03">^C</button>
+  </nav>
+</main>
+
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

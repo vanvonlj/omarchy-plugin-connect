@@ -20,11 +20,12 @@ when there is one, and over Tailscale when there is not.
                 lucas.connect             ← Omarchy shell plugin (bar widget + panel)
 ```
 
-> **Status: step 1 of 7 done.** The daemon serves over the tailnet with real
-> TLS and refuses anyone Tailscale will not vouch for — verified end to end on
-> a live tailnet, under systemd, with a publicly-verified certificate chain.
-> There are no sessions yet: the only route is `/healthz`. `serve` and `status`
-> work today; `pair` and `devices` are step 3. See [Roadmap](#roadmap).
+> **Status: steps 1–2 of 7 done.** The daemon serves the PWA over the tailnet
+> with real TLS, lists your tmux sessions, and attaches to one in a live
+> terminal — verified end to end on a live tailnet against real sessions.
+> Every device is writable for now: per-device capabilities arrive with pairing
+> in step 3, though the read-only path is already built and tested. See
+> [Roadmap](#roadmap).
 
 ## Why
 
@@ -149,6 +150,24 @@ State detection is a heuristic over pane content and process state. It is
 allowed to be wrong; the terminal underneath is always the ground truth, and
 nothing in the UI is gated on the badge being right.
 
+### Attaching next to someone else
+
+tmux sizes a window to its clients, so a phone joining a session can reflow the
+terminal on the monitor at your desk. Two modes, because both situations are
+real:
+
+| Mode | tmux flags | Use |
+|---|---|---|
+| `fit` (default) | none | You are away from the desk. The window fits the phone. tmux's `window-size` defaults to `latest`, so the desktop reclaims the size the moment it is used again — the disruption is temporary and self-healing. |
+| `mirror` | `ignore-size` | Someone is using the session. This client never affects the size others see, at the cost of possibly seeing a window wider than the phone. |
+
+**Read-only is enforced by tmux, not by us.** A device without the write
+capability attaches with tmux's `read-only` client flag, so its input is
+discarded before it reaches the pane. Putting enforcement that close to the
+terminal means a bug in the daemon's message handling cannot promote a
+read-only device to a writable one. There is a test that removes the flag and
+confirms the guarantee breaks, so the test cannot quietly stop meaning anything.
+
 ## Layout
 
 ```
@@ -236,7 +255,7 @@ never disagree.
 ## Roadmap
 
 1. ~~**Daemon skeleton** — config, `serve`, tailnet listener with LocalAPI certs, health endpoint~~ ✅
-2. **Sessions** — tmux enumeration, websocket PTY attach, `xterm.js` client
+2. ~~**Sessions** — tmux enumeration, websocket PTY attach, `xterm.js` client~~ ✅
 3. **Identity** — Tailscale WhoIs admission, LAN pairing + device tokens, capabilities
 4. **Plugin** — bar widget, settings panel, pairing QR, device management
 5. **Agent awareness** — detection, state badges, approve/deny, key bar
