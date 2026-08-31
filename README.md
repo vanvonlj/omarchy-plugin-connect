@@ -20,11 +20,12 @@ when there is one, and over Tailscale when there is not.
                 lucas.connect             ← Omarchy shell plugin (bar widget + panel)
 ```
 
-> **Status: steps 1–2 of 7 done.** The daemon serves the PWA over the tailnet
-> with real TLS, lists your tmux sessions, and attaches to one in a live
-> terminal — verified end to end on a live tailnet against real sessions.
-> Every device is writable for now: per-device capabilities arrive with pairing
-> in step 3, though the read-only path is already built and tested. See
+> **Status: steps 1–3 of 7 done.** The daemon serves the PWA over the tailnet
+> with real TLS, lists and attaches to tmux sessions, and enforces per-device
+> capabilities: every device arrives read-only and is promoted from the
+> desktop. Verified end to end on a live tailnet — a read-only device is
+> blocked from typing, a promoted one types, and revoking one closes the
+> terminal it is holding open. The plugin (step 4) is next. See
 > [Roadmap](#roadmap).
 
 ## Why
@@ -125,6 +126,24 @@ it to `write` is a deliberate act at the desktop. These sessions have a shell
 and an agent in them; a phone left on a café table should not be one tap from
 `rm -rf`.
 
+Capabilities are re-read while a terminal is open, not only at connect time.
+Demoting or revoking a device closes the session it is currently holding, within
+seconds. Revocation that waits for the device to disconnect is not revocation —
+the case it exists for is a device that is connected right now.
+
+**Revoking means different things to the two kinds, so it does both.** A paired
+device is deleted: its token hash goes with the record and the token it holds
+stops matching anything. A tailnet device cannot be revoked by deletion, because
+Tailscale keeps vouching for it and the record is recreated on its next request
+— read-only, with a fresh id, and a device list that looks reassuringly clean.
+So a revoked tailnet device is *blocked* instead, and the record is kept
+precisely in order to keep refusing it. `devices unblock` lets it back in,
+read-only.
+
+**Pairing an already-known device names it rather than duplicating it.** Scan
+the QR from a phone that is already on the tailnet and you get one device with
+the name you chose, not a second row that the panel can promote to no effect.
+
 ## Sessions
 
 tmux is the transport; agent awareness is a layer on top.
@@ -224,12 +243,22 @@ that tells you the daemon is missing and shows you the command to fix it.
 ## Use
 
 ```bash
-omarchy-connect status          # listeners, tier, paired devices, sessions
-omarchy-connect serve           # foreground; the unit does this for you
-omarchy-connect pair            # print a pairing URL + QR to the terminal
-omarchy-connect devices         # list paired devices
-omarchy-connect devices revoke <name>
+omarchy-connect status                     # listeners, TLS, preconditions
+omarchy-connect serve                      # foreground; the unit does this
+omarchy-connect pair                       # QR + URL, valid for 3 minutes
+omarchy-connect devices                    # every device and its capability
+omarchy-connect devices allow <id>         # let it type
+omarchy-connect devices readonly <id>      # take that back
+omarchy-connect devices rename <id> <name>
+omarchy-connect devices revoke <id>        # delete a token, block a tailnet node
+omarchy-connect devices unblock <id>
 ```
+
+Every one of these takes `--json`, because the plugin panel is the intended
+front end and shells out to this binary rather than reimplementing any of it.
+`pair --json` returns the URL, the expiry, and the QR as a 0/1 matrix in the
+same shape `omarchy-network-qr` emits — so the panel draws QML rectangles
+instead of decoding an image.
 
 Everything above is also in the plugin panel, which is where it is meant to be
 used from. The CLI is the source of truth the QML calls into, so the two can
@@ -256,7 +285,7 @@ never disagree.
 
 1. ~~**Daemon skeleton** — config, `serve`, tailnet listener with LocalAPI certs, health endpoint~~ ✅
 2. ~~**Sessions** — tmux enumeration, websocket PTY attach, `xterm.js` client~~ ✅
-3. **Identity** — Tailscale WhoIs admission, LAN pairing + device tokens, capabilities
+3. ~~**Identity** — Tailscale WhoIs admission, pairing + device tokens, capabilities~~ ✅
 4. **Plugin** — bar widget, settings panel, pairing QR, device management
 5. **Agent awareness** — detection, state badges, approve/deny, key bar
 6. **Push** — VAPID, subscription storage, awaiting-state notifications

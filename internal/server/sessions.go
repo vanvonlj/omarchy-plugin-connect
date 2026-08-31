@@ -25,6 +25,11 @@ const attachWriteTimeout = 10 * time.Second
 // two frames, small enough that an idle session is not holding much.
 const outputBuf = 32 * 1024
 
+// capabilityCheckInterval is how often a live attach re-reads its device's
+// capability. Short enough that revocation feels immediate, long enough that a
+// dozen open terminals are not hammering the device store.
+const capabilityCheckInterval = 15 * time.Second
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := session.List(r.Context())
 	if err != nil {
@@ -63,11 +68,8 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		mode = session.ModeMirror
 	}
 
-	// Every attach is writable for now. Per-device capabilities arrive with
-	// pairing in step 3; until then the only callers are tailnet peers that
-	// already passed admission, and the plumbing below takes the flag so that
-	// change is a one-line edit rather than a redesign.
-	writable := true
+	dev := deviceFrom(r.Context())
+	writable := dev.EffectiveCapability().CanWrite()
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Same-origin only, which is the default, stated here because it is a
@@ -89,7 +91,8 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	defer att.Close()
 
-	s.log.Info("attached", "session", name, "mode", mode, "size", size)
+	s.log.Info("attached", "session", name, "device", dev.Name,
+		"capability", dev.EffectiveCapability(), "mode", mode, "size", size)
 
 	// The two pumps are peers: whichever stops first tears down the other by
 	// cancelling this context, so a dead PTY does not leave a websocket open
@@ -98,6 +101,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	go s.pumpInput(ctx, cancel, conn, att)
+	go s.watchCapability(ctx, cancel, conn, dev.ID, writable)
 	s.pumpOutput(ctx, cancel, conn, att)
 
 	s.log.Info("detached", "session", name)
@@ -173,4 +177,40 @@ func queryInt(r *http.Request, key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// watchCapability closes a live attach when the device's capability is reduced
+// or the device is revoked.
+//
+// Without this, revoking a device would leave whatever terminals it already had
+// open running until it chose to disconnect -- so a lost phone would keep its
+// session for as long as it stayed connected, which is precisely the case
+// revocation exists for.
+func (s *Server) watchCapability(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, deviceID string, hadWrite bool) {
+	defer cancel()
+
+	tick := time.NewTicker(capabilityCheckInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			cap, ok := s.capabilityOf(deviceID)
+			if !ok {
+				s.log.Info("closing attach: device revoked", "device", deviceID)
+				conn.Close(websocket.StatusPolicyViolation, "device revoked")
+				return
+			}
+			// A write device demoted to read must not keep typing. Closing is
+			// blunt but honest: the client reconnects and gets a read-only
+			// attach, rather than silently losing keystrokes.
+			if hadWrite && !cap.CanWrite() {
+				s.log.Info("closing attach: device demoted to read-only", "device", deviceID)
+				conn.Close(websocket.StatusPolicyViolation, "device is now read-only")
+				return
+			}
+		}
+	}
 }

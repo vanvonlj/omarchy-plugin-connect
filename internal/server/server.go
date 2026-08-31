@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vanvonlj/omarchy-plugin-connect/internal/auth"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/config"
+	"github.com/vanvonlj/omarchy-plugin-connect/internal/device"
+	"github.com/vanvonlj/omarchy-plugin-connect/internal/pairing"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/transport"
 	"github.com/vanvonlj/omarchy-plugin-connect/internal/webui"
 )
@@ -23,11 +24,13 @@ type Server struct {
 	cfg     config.Config
 	log     *slog.Logger
 	version string
+	devices *device.Store
+	pairing *pairing.Store
 }
 
 // New returns a server bound to a probed tailnet node.
-func New(tn *transport.Tailnet, cfg config.Config, log *slog.Logger, version string) *Server {
-	return &Server{tn: tn, cfg: cfg, log: log, version: version}
+func New(tn *transport.Tailnet, cfg config.Config, log *slog.Logger, version string, devices *device.Store, pairs *pairing.Store) *Server {
+	return &Server{tn: tn, cfg: cfg, log: log, version: version, devices: devices, pairing: pairs}
 }
 
 // Handler returns the tailnet request handler, admission included.
@@ -36,38 +39,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	mux.HandleFunc("GET /api/sessions/{name}/attach", s.handleAttach)
+	mux.HandleFunc("GET /api/me", s.handleMe)
+	mux.HandleFunc("POST /api/pair", s.handlePair)
 	mux.Handle("GET /", webui.Handler())
-	return s.admitTailnet(mux)
-}
-
-// admitTailnet refuses any request whose peer Tailscale will not vouch for.
-//
-// The check is on every request rather than once per connection: a decision
-// cached for the life of a keep-alive connection would outlive a revocation,
-// and revocation that does not take effect immediately is not revocation.
-func (s *Server) admitTailnet(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		who, err := s.tn.WhoIs(r.Context(), r.RemoteAddr)
-		if err != nil {
-			// A lookup failure is a refusal. Tailscale not being able to
-			// identify a caller is exactly the case this gate exists for, so it
-			// must not be treated as "unknown, therefore proceed".
-			s.log.Warn("admission lookup failed", "remote", r.RemoteAddr, "err", err)
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-
-		decision := auth.AdmitTailnet(auth.Self{UserID: s.tn.UserID}, who)
-		if !decision.Allowed {
-			s.log.Warn("refused", "peer", decision.Peer, "reason", decision.Reason)
-			// The caller gets a bare 403. The reason goes to the log and the
-			// desktop, not to whoever was turned away.
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
+	return s.identify(mux)
 }
 
 type health struct {

@@ -11,6 +11,72 @@ let term = null;
 let fit = null;
 let ws = null;
 let ctrlArmed = false;
+let me = null;   // this device: name, capability, canWrite
+
+// ---------- pairing ----------
+
+// A QR carries the daemon URL plus a one-time code. Redeem it before anything
+// else, then strip it from the address bar: a code left in the URL survives in
+// history and in whatever the browser syncs between devices, long after it has
+// stopped being single-use in any meaningful sense.
+async function redeemPairingCode() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('pair');
+  if (!code) return;
+
+  history.replaceState(null, '', location.pathname);
+
+  try {
+    const res = await fetch('/api/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, name: deviceName() }),
+    });
+    if (!res.ok) {
+      listStatus.textContent = 'Pairing failed: the code was invalid or had expired.';
+      return;
+    }
+  } catch (err) {
+    listStatus.textContent = `Pairing failed: ${err.message}`;
+  }
+}
+
+// A first guess at a name, so the device list is not a row of "Paired device".
+// It is editable from the plugin panel, which is the point of storing it.
+function deviceName() {
+  const ua = navigator.userAgent;
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua)) return 'iPad';
+  if (/Android/.test(ua)) return 'Android phone';
+  if (/Macintosh/.test(ua)) return 'Mac';
+  if (/Linux/.test(ua)) return 'Linux browser';
+  if (/Windows/.test(ua)) return 'Windows browser';
+  return 'Paired device';
+}
+
+async function loadMe() {
+  try {
+    const res = await fetch('/api/me');
+    if (!res.ok) return;
+    me = await res.json();
+  } catch {
+    me = null;
+  }
+  renderCapability();
+}
+
+// Say read-only up front. tmux enforces it regardless, but letting someone type
+// into a terminal for a while and wonder why nothing lands is a poor way to
+// find out.
+function renderCapability() {
+  const banner = document.getElementById('capability');
+  if (!me || me.canWrite) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  banner.textContent = `Read-only — promote "${me.name}" on the desktop to type`;
+}
 
 // ---------- session list ----------
 
@@ -119,7 +185,7 @@ function attach(name) {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    termStatus.textContent = '';
+    termStatus.textContent = me && !me.canWrite ? 'read-only' : '';
     term.focus();
   };
 
@@ -128,6 +194,14 @@ function attach(name) {
   };
 
   ws.onclose = (ev) => {
+    // 1008 is the daemon cutting a device off mid-session: revoked, or demoted
+    // to read-only while holding a terminal open.
+    if (ev.code === 1008) {
+      termStatus.textContent = ev.reason || 'access withdrawn';
+      loadMe();
+      term.options.cursorBlink = false;
+      return;
+    }
     // 1000 is the daemon saying the session ended, which is information, not a
     // fault. Anything else is a drop worth flagging so nobody types into a
     // terminal that stopped listening several minutes ago.
@@ -226,4 +300,10 @@ function wrapCtrl(data) {
 document.getElementById('back').addEventListener('click', detach);
 document.getElementById('refresh').addEventListener('click', loadSessions);
 
-loadSessions();
+async function start() {
+  await redeemPairingCode();
+  await loadMe();
+  await loadSessions();
+}
+
+start();

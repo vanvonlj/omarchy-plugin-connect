@@ -169,3 +169,12 @@ header button {
   color: #0e0e10;
   border-color: var(--accent);
 }
+
+#capability {
+  margin: 0;
+  padding: 10px 16px;
+  background: #2a2313;
+  border-bottom: 1px solid var(--border);
+  color: var(--warn);
+  font-size: 13px;
+}

@@ -65,6 +65,19 @@ omarchy plugin validate .
   only (badge visibility, refresh interval).
 - **Agent state detection is a heuristic and is allowed to be wrong.** Never
   gate a capability on it. The terminal is ground truth; the badge is a hint.
+- **Deleting a tailnet device does not revoke it.** Tailscale keeps vouching for
+  the node, so the record is recreated on its next request with a fresh id. That
+  is why `Blocked` exists. Any new "remove this device" path must go through
+  `Revoke`, which picks deletion or blocking by kind.
+- **Capability checks must fail closed.** `EffectiveCapability` treats an
+  unrecognised value, and any blocked device, as `read`. A hand-edited or
+  future-versioned `devices.json` must never grant more than it names.
+- **The device store is written by two processes** — the daemon touching
+  LastSeen and the CLI changing capabilities from the panel. Every mutation is a
+  read-modify-write under `flock`. A test removes the lock and shows 20
+  concurrent registrations losing half their devices; keep it that way.
+- **`pkill -f 'omarchy-connect serve'` kills your own shell** when the command
+  line that runs it contains that string. Use `pkill -x omarchy-connect`.
 - **`WhoIs` on a tagged node returns tags and no user profile.** Do not write
   the admission check as "compare UserID to ours" — a tagged node's absent or
   synthetic user must be an explicit refusal, not a comparison that happens to

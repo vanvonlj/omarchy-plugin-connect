@@ -28,6 +28,8 @@ const usage = `omarchy-connect - remote access to this machine's tmux and agent 
 Usage:
   omarchy-connect serve            run the daemon (the systemd user unit does this)
   omarchy-connect status [--json]  report listeners, TLS, and preconditions
+  omarchy-connect pair [--json]    show a QR code to pair a new device
+  omarchy-connect devices ...      list, rename, promote, or revoke devices
   omarchy-connect version
 
 Settings live in ~/.config/omarchy/connect/config.json and are edited from the
@@ -46,6 +48,10 @@ func main() {
 		err = serve(os.Args[2:])
 	case "status":
 		err = status(os.Args[2:])
+	case "pair":
+		err = pairCmd(os.Args[2:])
+	case "devices":
+		err = devicesCmd(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
@@ -95,7 +101,12 @@ func serve(args []string) error {
 		log.Warn("certificate warm-up failed; the first request will retry", "err", err)
 	}
 
-	return server.New(tn, cfg, log, version).Run(ctx)
+	devices, pairs, err := openStores()
+	if err != nil {
+		return err
+	}
+
+	return server.New(tn, cfg, log, version, devices, pairs).Run(ctx)
 }
 
 type statusReport struct {
