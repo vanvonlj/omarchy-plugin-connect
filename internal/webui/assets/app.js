@@ -13,6 +13,7 @@ let ws = null;
 let ctrlArmed = false;
 let me = null;   // this device: name, capability, canWrite
 let knownSessions = [];
+let unpaired = false;
 
 // ---------- pairing ----------
 
@@ -58,12 +59,38 @@ function deviceName() {
 async function loadMe() {
   try {
     const res = await fetch('/api/me');
-    if (!res.ok) return;
+    if (!res.ok) {
+      me = null;
+      unpaired = res.status === 403;
+      renderCapability();
+      return;
+    }
     me = await res.json();
+    unpaired = false;
   } catch {
     me = null;
   }
   renderCapability();
+}
+
+// showUnpaired explains the one thing that fixes this, rather than reporting a
+// status code. A device reaches this state by opening the URL directly instead
+// of scanning the QR -- which is exactly what someone does on their second
+// visit, before the token cookie exists.
+function showUnpaired() {
+  knownSessions = [];
+  sessionsEl.replaceChildren();
+  listStatus.innerHTML = '';
+
+  const h = document.createElement('strong');
+  h.textContent = 'This device is not paired yet.';
+  const p = document.createElement('p');
+  p.textContent = 'Open the Connect panel on the desktop, press "Pair a device", '
+    + 'and scan the QR code with this phone. Opening this address directly is not enough — '
+    + 'on the local network the daemon has no way to know who you are without it.';
+  p.style.marginTop = '8px';
+
+  listStatus.append(h, p);
 }
 
 // Say read-only up front. tmux enforces it regardless, but letting someone type
@@ -71,7 +98,7 @@ async function loadMe() {
 // find out.
 function renderCapability() {
   const banner = document.getElementById('capability');
-  const canWrite = !me || me.canWrite;
+  const canWrite = !unpaired && (!me || me.canWrite);
 
   // Hide the controls a read-only device cannot use rather than letting it
   // press them and collect an error.
@@ -96,6 +123,15 @@ async function loadSessions() {
   let sessions;
   try {
     const res = await fetch('/api/sessions');
+
+    // A 403 here is the ordinary state of an unpaired device on the LAN tier,
+    // not a fault. Reporting it as "could not reach the daemon" is doubly
+    // wrong: the daemon answered, and the thing to do about it is not to
+    // check the network but to scan a QR.
+    if (res.status === 403) {
+      showUnpaired();
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     sessions = await res.json();
   } catch (err) {

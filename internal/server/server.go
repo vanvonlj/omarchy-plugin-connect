@@ -60,12 +60,12 @@ func (s *Server) routes() *http.ServeMux {
 
 // Handler returns the tailnet request handler, admission included.
 func (s *Server) Handler() http.Handler {
-	return s.identify(s.routes())
+	return s.accessLog("tailnet", s.identify(s.routes()))
 }
 
 // LANHandler returns the tier-2 handler, which accepts device tokens only.
 func (s *Server) LANHandler() http.Handler {
-	return s.identifyLAN(s.routes())
+	return s.accessLog("lan", s.identifyLAN(s.routes()))
 }
 
 type health struct {

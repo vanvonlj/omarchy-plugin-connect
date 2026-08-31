@@ -167,6 +167,44 @@ omarchy plugin validate .
   once. Check it explicitly at startup and say so plainly rather than failing
   with a permissions error from two layers down.
 
+## The subnet-route trap
+
+**Do not accept subnet routes on a machine that is physically on the advertised
+subnet.** `local-network-connector` advertises `10.0.0.0/23`, which is this
+laptop's own LAN, and with `--accept-routes` on the kernel routed replies to
+local devices out through tailscale0:
+
+    ip route get 10.0.1.47
+    10.0.1.47 dev tailscale0 table 52 src 100.98.170.119     # broken
+    10.0.1.47 dev wlp1s0 src 10.0.1.163                      # correct
+
+The symptom is brutal to diagnose because everything looks healthy: `ping`
+succeeds (it round-trips through the subnet router), ufw shows the port open and
+logs no blocks, the listener is bound, and curl from the machine itself works
+because that stays on loopback. Only a phone sees it, as a connection stuck in
+`SYN-RECV` and then a timeout -- the SYN arrives, the SYN-ACK leaves with a
+100.x source, and the client never sees a valid reply.
+
+Fixed with `tailscale set --accept-routes=false` on this machine. The phone
+still needs to accept that route when roaming; the daemon's host must not.
+
+## Diagnosing "it does not load"
+
+Ordered by how much time each saves:
+
+1. `ss -tn state all '( sport = :7433 )'` -- `SYN-RECV` means the reply is not
+   getting back, which is routing, not the application.
+2. `ip route get <client-ip>` -- must be the LAN interface, not tailscale0.
+3. `omarchy-connect serve --verbose` -- logs every request with status. Silence
+   here with connections in `ss` means the handshake never completed.
+4. `journalctl -k | grep 'UFW BLOCK'` -- readable without root on this machine.
+   No entry for the client means the firewall is not involved.
+5. Swap the daemon for `python3 -m http.server 7433 --bind <lan-ip>`. If that
+   also fails, the fault is not in this codebase.
+
+Note that curl from this machine to its own LAN address never proves anything
+about a phone: it stays on loopback, bypassing both ufw and the routing table.
+
 ## This machine's tailnet
 
 Verified 2026-08-30, useful because every manual test names one of these.
