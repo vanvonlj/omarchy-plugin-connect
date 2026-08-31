@@ -1,0 +1,14 @@
+# Go
+/bin/
+/dist/
+*.test
+*.out
+
+# Web build output
+/web/dist/
+/node_modules/
+
+# Local daemon state (never belongs in the repo)
+*.pem
+*.key
+config.local.json
