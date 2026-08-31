@@ -20,13 +20,12 @@ when there is one, and over Tailscale when there is not.
                 lucas.connect             ← Omarchy shell plugin (bar widget + panel)
 ```
 
-> **Status: steps 1–3 of 7 done.** The daemon serves the PWA over the tailnet
+> **Status: steps 1–4 of 7 done.** The daemon serves the PWA over the tailnet
 > with real TLS, lists and attaches to tmux sessions, and enforces per-device
 > capabilities: every device arrives read-only and is promoted from the
-> desktop. Verified end to end on a live tailnet — a read-only device is
-> blocked from typing, a promoted one types, and revoking one closes the
-> terminal it is holding open. The plugin (step 4) is next. See
-> [Roadmap](#roadmap).
+> desktop. The Omarchy plugin is installed and loading — a bar widget that
+> pairs by QR and manages devices. What is left is agent awareness and push.
+> See [Roadmap](#roadmap).
 
 ## Why
 
@@ -211,6 +210,30 @@ straight into `~/.config/omarchy/plugins/<id>/` and expects to find
 `manifest.json` there. One repo therefore holds both halves: the shell plugin
 that Omarchy installs, and the daemon source that it does not.
 
+## The plugin
+
+A bar widget whose panel is where all of this is meant to be used from.
+
+- **Status** — whether the daemon is serving, the URL to reach it at, and a
+  warning if the tailnet has no HTTPS certificates. The bar icon is dim when
+  nothing is listening, so the one fact worth reading without opening anything
+  is readable without opening anything.
+- **Pair a device** — draws a QR of the pairing link, counting down its three
+  minute life. The matrix comes from `omarchy-connect pair --json` in the same
+  0/1 shape `omarchy-network-qr` emits, so the panel draws QML rectangles and
+  never touches an image decoder.
+- **Devices** — every phone and Omarchy box, with a switch for whether it may
+  type, inline rename, and revoke. A blocked device says so and can be let back
+  in read-only.
+- **Start / Stop** — the systemd user unit, without leaving the panel.
+
+Keys: `j`/`k` move, `enter` toggles typing, `n` rename, `x` revoke, `u` unblock,
+`p` pair, `y` copy the pairing link, `r` refresh.
+
+The panel holds no state of its own. Every action shells out to
+`omarchy-connect`, which is why the panel and the terminal cannot disagree about
+what the daemon thinks.
+
 ## Install
 
 Prerequisites: `tmux`, `go` (build only), and `tailscale` for anything past
@@ -286,7 +309,7 @@ never disagree.
 1. ~~**Daemon skeleton** — config, `serve`, tailnet listener with LocalAPI certs, health endpoint~~ ✅
 2. ~~**Sessions** — tmux enumeration, websocket PTY attach, `xterm.js` client~~ ✅
 3. ~~**Identity** — Tailscale WhoIs admission, pairing + device tokens, capabilities~~ ✅
-4. **Plugin** — bar widget, settings panel, pairing QR, device management
+4. ~~**Plugin** — bar widget, settings panel, pairing QR, device management~~ ✅
 5. **Agent awareness** — detection, state badges, approve/deny, key bar
 6. **Push** — VAPID, subscription storage, awaiting-state notifications
 7. **Packaging** — PKGBUILD, systemd user unit, `make install`

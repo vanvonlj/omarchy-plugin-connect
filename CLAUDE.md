@@ -78,6 +78,27 @@ omarchy plugin validate .
   concurrent registrations losing half their devices; keep it that way.
 - **`pkill -f 'omarchy-connect serve'` kills your own shell** when the command
   line that runs it contains that string. Use `pkill -x omarchy-connect`.
+
+## Testing the plugin on a live desktop
+
+- **`omarchy-shell shell rescanPlugins` can crash the running shell.** Observed
+  once: the reload put `omarchy.lock` into `lock-stranded: recovering`, which
+  reached `FATAL: Tried to show lockscreen surfaces without active lock` and
+  aborted Quickshell. It restarted itself, so the desktop recovered, but this is
+  an upstream Omarchy fault worth knowing about before rescanning someone's live
+  session -- especially while the machine is idle or locking.
+- **`QS_DISABLE_FILE_WATCHER=1` is set in this session**, so saving a plugin
+  file does *not* hot-reload it despite what the shell README says. `rescanPlugins`
+  is the only reload path, which is unfortunate given the point above.
+- **`grim` blocks forever when the display is asleep** (`hyprctl monitors -j`
+  → `dpmsStatus: false`) and also while a panel holds a Wayland focus grab. Both
+  look identical to a hung screenshot. Check DPMS before concluding anything is
+  broken, and never wake the user's display to take one.
+- **Verify a widget rendered, not just that it loaded.** A bar widget with no
+  `implicitWidth`/`implicitHeight` lays out at 0x0: the plugin loads, its IPC
+  answers, and nothing appears. `hyprctl layers -j` showing a real surface plus
+  a clean journal is the evidence; `omarchy-shell lucas.connect open` returning
+  0 is not.
 - **`WhoIs` on a tagged node returns tags and no user profile.** Do not write
   the admission check as "compare UserID to ours" — a tagged node's absent or
   synthetic user must be an explicit refusal, not a comparison that happens to
