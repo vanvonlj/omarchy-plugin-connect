@@ -110,6 +110,9 @@ func (s *Server) Run(ctx context.Context) error {
 			"lost", "PWA install, service worker, web push")
 	}
 
+	// Every server that must be shut down before wg.Wait() returns.
+	servers := []*http.Server{srv}
+
 	var wg sync.WaitGroup
 	errs := make(chan error, len(lns))
 	for _, ln := range lns {
@@ -143,7 +146,12 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			s.log.Error("LAN listener failed to bind; tier 2 is off", "err", err)
 		} else {
-			defer shutdown(lanSrv)
+			// Registered for shutdown rather than deferred. A deferred shutdown
+			// runs after wg.Wait(), and the wait includes this server's own
+			// serve goroutine, which does not return until the server is shut
+			// down -- so the daemon hangs on exit still holding the LAN port,
+			// and the next start cannot bind it.
+			servers = append(servers, lanSrv)
 			s.log.Info("listening on the LAN",
 				"url", s.lan.URL(s.cfg.LAN.Port), "iface", s.lan.Iface)
 			if hint := s.lan.FirewallHint(s.cfg.LAN.Port); hint != "" {
@@ -164,14 +172,20 @@ func (s *Server) Run(ctx context.Context) error {
 	case err := <-errs:
 		// One listener failing takes the daemon down rather than leaving it
 		// half-reachable, which is far harder to diagnose from a phone.
-		shutdown(srv)
+		shutdownAll(servers)
 		wg.Wait()
 		return err
 	}
 
-	shutdown(srv)
+	shutdownAll(servers)
 	wg.Wait()
 	return nil
+}
+
+func shutdownAll(servers []*http.Server) {
+	for _, srv := range servers {
+		shutdown(srv)
+	}
 }
 
 func shutdown(srv *http.Server) {

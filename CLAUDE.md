@@ -63,6 +63,11 @@ omarchy plugin validate .
 - **The LAN listener must never call `WhoIs`.** Source addresses on a LAN socket
   are unverified, so a spoofed `100.x` source would resolve to a real tailnet
   peer and be admitted tokenless. Tier 2 accepts device tokens only.
+- **Shut every listener down before `wg.Wait()`.** A `defer shutdown(lanSrv)`
+  runs after the wait, and the wait includes that server's own serve goroutine,
+  which does not return until it is shut down. The daemon then hangs on exit
+  still holding the LAN port, and the next start cannot bind it. The symptom is
+  a process that survives SIGTERM owning one socket and not the others.
 - **Testing tier 2 with curl from this machine does not exercise the firewall.**
   Traffic to a local address stays on loopback, which ufw allows by default. A
   green curl says nothing about whether a phone can reach it.
