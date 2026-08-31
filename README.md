@@ -123,6 +123,51 @@ browser cannot know that, and an `http://` origin is not a secure context, so
 the PWA install, the service worker, and web push are all lost. It is a
 fallback, not a supported configuration.
 
+## Roaming
+
+Leaving the house and coming back should cost nothing. Two pieces make that
+true, and they are independent.
+
+**One origin, everywhere.** Point the phone at the LAN address and keep it
+there. On the wifi it connects directly. Away from it, Tailscale carries the
+same address over a subnet route, so the URL, the installed page, the stored
+token and the open session are all unchanged. Origin-scoped state — cookies,
+`localStorage` — survives the move because the origin never moved.
+
+That needs a subnet router on the tailnet advertising the LAN prefix, which is
+one setting on any always-on machine there:
+
+```bash
+tailscale set --advertise-routes=10.0.1.0/24   # then approve it in the admin console
+tailscale status --json | jq '.Peer[] | select(.PrimaryRoutes) | {HostName, PrimaryRoutes}'
+```
+
+The trade is the one tier 2 always makes: an IP cannot have a certificate here,
+so this origin is HTTP and cannot install as an app or send push. If the phone
+will always have Tailscale, the MagicDNS origin roams just as seamlessly and
+keeps HTTPS — the subnet route buys the case where it does not.
+
+**Reconnection, which is where the work is.** tmux already holds the session, so
+nothing needs to be replayed; the client just has to be willing to dial again.
+It reconnects with jittered backoff (0.5s up to 15s), and immediately rather
+than on the next backoff step when the browser fires `online`, `focus`, or
+`visibilitychange` — the three moments when a phone has just discovered the
+network changed. While the radio is off it waits rather than burning retries, so
+the queue is not long precisely when the network returns.
+
+A session code of 1000 (the session ended) or 1008 (the device was revoked or
+demoted) stops the loop; retrying either would be a client arguing with a
+decision already made.
+
+The last attached session is remembered, so reopening the app after iOS has
+discarded the tab lands back in the terminal rather than the list — but only if
+that session still exists.
+
+Server-side, an attached client is pinged every 30 seconds. A phone that walks
+out of range stops reading without closing anything, and the socket would
+otherwise stay open here for minutes with a tmux client still attached to it,
+still voting on the window size.
+
 ## Identity
 
 Two ways in, deliberately different.

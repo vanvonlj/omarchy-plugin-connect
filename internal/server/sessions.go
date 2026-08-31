@@ -30,6 +30,19 @@ const outputBuf = 32 * 1024
 // dozen open terminals are not hammering the device store.
 const capabilityCheckInterval = 15 * time.Second
 
+// keepaliveInterval is how often the server pings an attached client.
+//
+// A phone that walks out of wifi range stops reading without closing anything,
+// and the socket stays "open" on this side until the kernel gives up -- which
+// can be many minutes. During that time tmux still has a client attached, and
+// with fit mode that client is still voting on the window size. Pinging turns
+// a silent death into a prompt one.
+const keepaliveInterval = 30 * time.Second
+
+// pongTimeout is how long a client has to answer. Generous, because a phone
+// waking from sleep can be slow before it is gone.
+const pongTimeout = 15 * time.Second
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := session.List(r.Context())
 	if err != nil {
@@ -102,6 +115,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 
 	go s.pumpInput(ctx, cancel, conn, att)
 	go s.watchCapability(ctx, cancel, conn, dev.ID, writable)
+	go s.keepalive(ctx, cancel, conn, name)
 	s.pumpOutput(ctx, cancel, conn, att)
 
 	s.log.Info("detached", "session", name)
@@ -209,6 +223,35 @@ func (s *Server) watchCapability(ctx context.Context, cancel context.CancelFunc,
 			if hadWrite && !cap.CanWrite() {
 				s.log.Info("closing attach: device demoted to read-only", "device", deviceID)
 				conn.Close(websocket.StatusPolicyViolation, "device is now read-only")
+				return
+			}
+		}
+	}
+}
+
+// keepalive detaches a client that has stopped answering.
+//
+// Without it a roaming phone leaves a tmux client attached behind it, and the
+// next attach from the same phone is a second client rather than a replacement.
+func (s *Server) keepalive(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, session string) {
+	defer cancel()
+
+	tick := time.NewTicker(keepaliveInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			pingCtx, done := context.WithTimeout(ctx, pongTimeout)
+			err := conn.Ping(pingCtx)
+			done()
+			if err != nil {
+				// Expected whenever someone walks out of range, so it is not an
+				// error: the client reconnects on its own when the network
+				// comes back, and tmux held the session the whole time.
+				s.log.Info("client stopped answering; detaching", "session", session)
 				return
 			}
 		}

@@ -71,6 +71,13 @@ omarchy plugin validate .
 - **Testing tier 2 with curl from this machine does not exercise the firewall.**
   Traffic to a local address stays on loopback, which ufw allows by default. A
   green curl says nothing about whether a phone can reach it.
+- **Never set `PrivateTmp=` on the unit.** tmux's server socket is at
+  `/tmp/tmux-$UID/default`, so a private `/tmp` hides every session on the
+  machine. The failure is silent and deeply misleading: the daemon starts, TLS
+  works, the UI loads, `/api/sessions` returns `[]`, and every attach fails with
+  "no tmux session named ...". It reads as a machine with nothing running. This
+  only reproduces under systemd -- a hand-started daemon shares `/tmp` and works
+  fine -- so test session listing through the unit, not from a terminal.
 - **Never bind a listener to `0.0.0.0`.** Bind the specific tailnet address, and
   the specific LAN address only when LAN mode is explicitly enabled. This is a
   security property stated in the README, not an implementation detail.

@@ -12,6 +12,7 @@ let fit = null;
 let ws = null;
 let ctrlArmed = false;
 let me = null;   // this device: name, capability, canWrite
+let knownSessions = [];
 
 // ---------- pairing ----------
 
@@ -95,11 +96,13 @@ async function loadSessions() {
   }
 
   if (sessions.length === 0) {
+    knownSessions = [];
     listStatus.textContent = 'No tmux sessions. Start one on the desktop.';
     return;
   }
 
   listStatus.textContent = '';
+  knownSessions = sessions.map((s) => s.name);
   for (const s of sessions) {
     sessionsEl.append(sessionRow(s));
   }
@@ -158,11 +161,50 @@ function relativeTime(iso) {
 
 // ---------- terminal ----------
 
+// Roaming is the normal case, not an error case. Walking out of the house
+// changes the path from a direct wifi connection to a Tailscale subnet route,
+// and every TCP connection in flight dies with it. tmux keeps the session, so
+// the only thing that needs to survive is this client's willingness to dial
+// again -- which is what the whole block below is for.
+
+let currentSession = null;
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+let deliberateClose = false;
+
+// Backoff: quick at first because most drops are a two-second network change,
+// then longer so a phone in a pocket is not dialling all night. Jitter keeps
+// several open tabs from retrying in lockstep.
+const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000];
+
+function backoffDelay() {
+  const base = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+  return base + Math.floor(Math.random() * 400);
+}
+
+const SESSION_KEY = 'omarchy_connect_last_session';
+
+function rememberSession(name) {
+  try { localStorage.setItem(SESSION_KEY, name); } catch {}
+}
+
+function forgetSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+function lastSession() {
+  try { return localStorage.getItem(SESSION_KEY); } catch { return null; }
+}
+
 function attach(name) {
   listView.hidden = true;
   termView.hidden = false;
   termName.textContent = name;
-  termStatus.textContent = '';
+
+  currentSession = name;
+  reconnectAttempt = 0;
+  deliberateClose = false;
+  rememberSession(name);
 
   term = new Terminal({
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -176,41 +218,6 @@ function attach(name) {
   term.open(document.getElementById('terminal'));
   fit.fit();
 
-  const url = new URL(`/api/sessions/${encodeURIComponent(name)}/attach`, location.href);
-  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.searchParams.set('cols', term.cols);
-  url.searchParams.set('rows', term.rows);
-
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    termStatus.textContent = me && !me.canWrite ? 'read-only' : '';
-    term.focus();
-  };
-
-  ws.onmessage = (ev) => {
-    if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
-  };
-
-  ws.onclose = (ev) => {
-    // 1008 is the daemon cutting a device off mid-session: revoked, or demoted
-    // to read-only while holding a terminal open.
-    if (ev.code === 1008) {
-      termStatus.textContent = ev.reason || 'access withdrawn';
-      loadMe();
-      term.options.cursorBlink = false;
-      return;
-    }
-    // 1000 is the daemon saying the session ended, which is information, not a
-    // fault. Anything else is a drop worth flagging so nobody types into a
-    // terminal that stopped listening several minutes ago.
-    termStatus.textContent = ev.code === 1000 ? 'session ended' : 'disconnected';
-    term.options.cursorBlink = false;
-  };
-
-  ws.onerror = () => { termStatus.textContent = 'connection error'; };
-
   term.onData((data) => send(data));
 
   window.addEventListener('resize', onResize);
@@ -220,30 +227,112 @@ function attach(name) {
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', onResize);
   }
+
+  connect();
 }
 
-function onResize() {
-  if (!fit || !term) return;
-  fit.fit();
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+function connect() {
+  if (!currentSession || !term) return;
+  clearTimeout(reconnectTimer);
+
+  setStatus(reconnectAttempt === 0 ? 'connecting' : `reconnecting…`);
+
+  const url = new URL(`/api/sessions/${encodeURIComponent(currentSession)}/attach`, location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('cols', term.cols);
+  url.searchParams.set('rows', term.rows);
+
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    reconnectAttempt = 0;
+    setStatus(me && !me.canWrite ? 'read-only' : '');
+    term.options.cursorBlink = true;
+    // tmux repaints the whole screen for a newly attached client, so there is
+    // nothing to replay here -- the session's current state arrives on its own.
+    term.focus();
+    onResize();
+  };
+
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
+  };
+
+  ws.onclose = (ev) => {
+    term.options.cursorBlink = false;
+    if (deliberateClose) return;
+
+    // 1008 is the daemon cutting this device off: revoked, or demoted to
+    // read-only while holding a terminal open. Retrying would be a client
+    // arguing with a decision made at the desktop, so it stops.
+    if (ev.code === 1008) {
+      setStatus(ev.reason || 'access withdrawn');
+      loadMe();
+      return;
+    }
+
+    // 1000 means the session itself ended. There is nothing to reconnect to.
+    if (ev.code === 1000) {
+      setStatus('session ended');
+      forgetSession();
+      return;
+    }
+
+    scheduleReconnect();
+  };
+
+  // onerror always precedes onclose, so reconnection is driven from onclose
+  // alone. Scheduling from both would double every backoff.
+  ws.onerror = () => {};
+}
+
+function scheduleReconnect() {
+  if (!currentSession) return;
+
+  // Offline is a state to wait out, not to back off through: burning retries
+  // while the radio is off means the queue is long precisely when the network
+  // returns. The online listener below wakes this up instead.
+  if (navigator.onLine === false) {
+    setStatus('offline');
+    return;
   }
+
+  const delay = backoffDelay();
+  reconnectAttempt++;
+  setStatus(`reconnecting…`);
+  reconnectTimer = setTimeout(connect, delay);
 }
 
-// sendRaw writes bytes exactly as given. The key bar uses it: an escape
-// sequence must not be reinterpreted by the ctrl modifier.
-function sendRaw(data) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(new TextEncoder().encode(data));
+// A dropped connection that the phone has not noticed yet looks exactly like a
+// live one. These three are the moments when the truth is likely to have
+// changed, and reconnecting eagerly at them is what makes coming home feel
+// instant rather than taking a backoff step.
+function reconnectNow() {
+  if (!currentSession) return;
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  reconnectAttempt = 0;
+  connect();
 }
 
-// send applies the sticky ctrl modifier, and is what the on-screen keyboard
-// feeds through.
-function send(data) {
-  sendRaw(wrapCtrl(data));
+window.addEventListener('online', reconnectNow);
+window.addEventListener('focus', reconnectNow);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') reconnectNow();
+});
+
+function setStatus(text) {
+  termStatus.textContent = text;
 }
 
 function detach() {
+  // Deliberate: going back to the list must not trigger the reconnect logic.
+  deliberateClose = true;
+  currentSession = null;
+  reconnectAttempt = 0;
+  clearTimeout(reconnectTimer);
+  forgetSession();
+
   window.removeEventListener('resize', onResize);
   if (window.visualViewport) {
     window.visualViewport.removeEventListener('resize', onResize);
@@ -304,6 +393,13 @@ async function start() {
   await redeemPairingCode();
   await loadMe();
   await loadSessions();
+
+  // iOS discards a backgrounded tab aggressively, so "open the app and carry
+  // on" has to survive a full page load, not just a dropped socket. Resume the
+  // session that was open, but only if it is still there -- landing on a
+  // terminal for a session that has since been killed is worse than the list.
+  const last = lastSession();
+  if (last && knownSessions.includes(last)) attach(last);
 }
 
 start();

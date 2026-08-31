@@ -19,8 +19,14 @@ RestartSec=5s
 # LocalAPI socket. Running this as root would need a different grant and would
 # hand a shell-adjacent service privileges it has no use for.
 NoNewPrivileges=true
-PrivateTmp=true
 ProtectSystem=strict
+
+# PrivateTmp is deliberately NOT set, and this is load-bearing rather than an
+# oversight. tmux's server socket lives at /tmp/tmux-$UID/default, so a private
+# /tmp hides every session on the machine: the daemon starts cleanly, serves the
+# UI, answers /api/sessions with an empty list, and refuses every attach with
+# "no tmux session named ...". It looks exactly like a machine with no sessions
+# open. Anything that reintroduces it has to bind-mount that socket back in.
 
 # Creates ~/.config/omarchy/connect (0700) and makes it writable under
 # ProtectSystem=strict. This replaces a ReadWritePaths= for the same directory,
