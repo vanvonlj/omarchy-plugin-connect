@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -128,7 +129,7 @@ func (l *LAN) Listen(ctx context.Context, port int) (net.Listener, error) {
 // hangs until it times out -- with nothing in any log to explain it. Naming the
 // rule is the difference between a five-second fix and an evening.
 func (l *LAN) FirewallHint(port int) string {
-	if !ufwActive() {
+	if !ufwActive() || ufwAllows(port, l.Iface) {
 		return ""
 	}
 	// Scoped to the one interface rather than opened globally: this port must
@@ -136,6 +137,63 @@ func (l *LAN) FirewallHint(port int) string {
 	// joins later.
 	return fmt.Sprintf("ufw is active and will drop LAN connections to port %d. Allow them with:\n"+
 		"    sudo ufw allow in on %s to any port %d proto tcp", port, l.Iface, port)
+}
+
+// ufwRules is world-readable (0644), which is what makes this checkable at all
+// from a daemon that deliberately does not run as root.
+const ufwRules = "/etc/ufw/user.rules"
+
+// ufwAllows reports whether a rule already accepts this port on this interface.
+//
+// Without it the warning is unconditional, so it keeps telling someone to add a
+// rule they added ten minutes ago -- and a warning that is wrong once is a
+// warning nobody reads the next time it is right.
+func ufwAllows(port int, iface string) bool {
+	raw, err := os.ReadFile(ufwRules)
+	if err != nil {
+		// Cannot tell. Warning is the safer answer: an unnecessary hint costs a
+		// line of output, a missing one costs an evening.
+		return false
+	}
+	return rulesAllow(string(raw), port, iface)
+}
+
+func rulesAllow(rules string, port int, iface string) bool {
+	want := strconv.Itoa(port)
+
+	for _, line := range strings.Split(rules, "\n") {
+		// Fields, not substrings. "--dport 7433" is a substring of
+		// "--dport 74330", so a Contains check silences the warning on a
+		// machine that is still dropping the traffic.
+		fields := strings.Fields(line)
+
+		var dport, in string
+		accept := false
+		for i, f := range fields {
+			switch f {
+			case "--dport":
+				if i+1 < len(fields) {
+					dport = fields[i+1]
+				}
+			case "-i":
+				if i+1 < len(fields) {
+					in = fields[i+1]
+				}
+			case "ACCEPT":
+				accept = true
+			}
+		}
+
+		if !accept || dport != want {
+			continue
+		}
+		// An interface-scoped rule must name our interface; a rule with no -i
+		// applies to all of them and covers us too.
+		if in == "" || in == iface {
+			return true
+		}
+	}
+	return false
 }
 
 func ufwActive() bool {
