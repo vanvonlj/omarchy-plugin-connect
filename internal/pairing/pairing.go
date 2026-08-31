@@ -32,7 +32,20 @@ type Pending struct {
 	Code    string    `json:"code"`
 	Created time.Time `json:"created"`
 	Expires time.Time `json:"expires"`
+
+	// Attempts counts failed redemptions.
+	Attempts int `json:"attempts"`
 }
+
+// maxAttempts is how many wrong codes a pending pairing survives.
+//
+// Clearing on the first failure looks stricter and is worse. Once tier 2 exists
+// the pairing endpoint is reachable by anything on the wifi, so a single wrong
+// guess from a stranger would cancel the pairing you are in the middle of --
+// a denial of service handed out for free. The code carries 128 bits of
+// entropy, so guessing is not the threat that needs defending against; a small
+// allowance keeps a typo or a double-scan from costing a re-pair.
+const maxAttempts = 5
 
 // Expired reports whether p can no longer be redeemed.
 func (p *Pending) Expired() bool { return time.Now().After(p.Expires) }
@@ -94,9 +107,9 @@ func (s *Store) Peek() (*Pending, error) {
 
 // Redeem consumes the pending pairing if code matches.
 //
-// Success and failure both clear it: a code that survived a wrong guess would
-// let someone keep guessing, and one that survived a right guess would pair
-// twice.
+// A correct code clears it immediately. A wrong one counts against maxAttempts
+// and clears it only once those run out, so a stranger on the wifi cannot
+// cancel a pairing in progress with a single bad guess.
 func (s *Store) Redeem(code string) error {
 	p, err := s.load()
 	if err != nil {
@@ -106,21 +119,35 @@ func (s *Store) Redeem(code string) error {
 		return ErrNoPending
 	}
 
-	defer s.clear()
-
 	if p.Expired() {
+		s.clear()
 		return ErrBadCode
 	}
+
 	if subtle.ConstantTimeCompare([]byte(p.Code), []byte(code)) != 1 {
+		p.Attempts++
+		if p.Attempts >= maxAttempts {
+			s.clear()
+		} else {
+			s.save(p)
+		}
 		return ErrBadCode
 	}
+
+	// Success consumes it. A code that survived a correct guess would pair
+	// twice, which is the one outcome worse than making someone scan again.
+	s.clear()
 	return nil
 }
 
 // URL is what the QR encodes.
-func (p *Pending) URL(host string, port int) string {
+//
+// The scheme is supplied by the caller rather than assumed: the tailnet origin
+// is https and the LAN origin can never be, because the tailnet certificate
+// carries one SAN and it is not a LAN address.
+func (p *Pending) URL(scheme, host string, port int) string {
 	u := url.URL{
-		Scheme:   "https",
+		Scheme:   scheme,
 		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
 		Path:     "/",
 		RawQuery: url.Values{"pair": {p.Code}}.Encode(),

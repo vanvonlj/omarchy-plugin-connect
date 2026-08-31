@@ -34,6 +34,11 @@ type Config struct {
 type LAN struct {
 	Enabled bool `json:"enabled"`
 	Port    int  `json:"port"`
+
+	// Address pins the interface address to bind. Empty means auto-detect the
+	// first private address that is not Tailscale, Docker, or a bridge. Pin it
+	// on a machine with several LANs, where "first" is a coin toss.
+	Address string `json:"address,omitempty"`
 }
 
 // Default returns the configuration used when none has been written yet.

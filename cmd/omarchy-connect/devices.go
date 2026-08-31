@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"text/tabwriter"
 	"time"
 
@@ -180,6 +181,14 @@ type pairOutput struct {
 	Code    string   `json:"code"`
 	Expires string   `json:"expires"`
 	Matrix  []string `json:"matrix"`
+
+	// The tier-2 pair, present only when the LAN listener is enabled. The panel
+	// offers this QR for a phone with no Tailscale on it, which is the case
+	// where the tailnet QR fails with ERR_NAME_NOT_RESOLVED -- MagicDNS means
+	// nothing to a device that is not on the tailnet.
+	LANURL    string   `json:"lanUrl,omitempty"`
+	LANMatrix []string `json:"lanMatrix,omitempty"`
+	Firewall  string   `json:"firewall,omitempty"`
 }
 
 // pairCmd starts a pairing and shows the QR.
@@ -213,29 +222,130 @@ func pairCmd(args []string) error {
 		return err
 	}
 
-	url := p.URL(tn.DNSName, cfg.Port)
+	scheme := "https"
+	if !tn.CertsAvailable {
+		scheme = "http"
+	}
+	url := p.URL(scheme, tn.DNSName, cfg.Port)
 	matrix, err := qr.Matrix(url)
 	if err != nil {
 		return err
 	}
 
+	out := pairOutput{
+		URL:     url,
+		Code:    p.Code,
+		Expires: p.Expires.Format(time.RFC3339),
+		Matrix:  matrix,
+	}
+
+	if cfg.LAN.Enabled {
+		if lan, err := transport.ProbeLAN(cfg.LAN.Address); err == nil {
+			out.LANURL = p.URL("http", lan.Addr.String(), cfg.LAN.Port)
+			if m, err := qr.Matrix(out.LANURL); err == nil {
+				out.LANMatrix = m
+			}
+			out.Firewall = lan.FirewallHint(cfg.LAN.Port)
+		}
+	}
+
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(pairOutput{
-			URL:     url,
-			Code:    p.Code,
-			Expires: p.Expires.Format(time.RFC3339),
-			Matrix:  matrix,
-		})
+		return enc.Encode(out)
 	}
 
 	fmt.Println()
 	fmt.Print(qr.Terminal(matrix))
 	fmt.Println()
-	fmt.Printf("  Scan within %s.\n", pairing.TTL)
-	fmt.Printf("  %s\n\n", url)
+	fmt.Printf("  Tailnet — scan within %s. Needs Tailscale on the phone.\n", pairing.TTL)
+	fmt.Printf("  %s\n", url)
+
+	if out.LANURL != "" {
+		fmt.Println()
+		fmt.Print(qr.Terminal(out.LANMatrix))
+		fmt.Println()
+		fmt.Println("  LAN — same wifi, no Tailscale needed. Plain HTTP, so no app install.")
+		fmt.Printf("  %s\n", out.LANURL)
+		if out.Firewall != "" {
+			fmt.Printf("\n  %s\n", out.Firewall)
+		}
+	}
+
+	fmt.Println()
 	fmt.Println("  The device pairs read-only. Give it write access with:")
 	fmt.Println("      omarchy-connect devices allow <id>")
 	return nil
+}
+
+const lanUsage = `Usage:
+  omarchy-connect lan on [--port N]   serve on this machine's LAN address too
+  omarchy-connect lan off             stop serving on the LAN
+`
+
+// lanCmd toggles tier 2.
+//
+// Config changes take effect at bind time, so the daemon is restarted here
+// rather than leaving someone to wonder why the setting they just changed had
+// no effect.
+func lanCmd(args []string) error {
+	if len(args) == 0 {
+		fmt.Print(lanUsage)
+		return errors.New("expected 'on' or 'off'")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "on":
+		fs := flag.NewFlagSet("lan on", flag.ExitOnError)
+		port := fs.Int("port", cfg.LAN.Port, "port for the LAN listener")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		lan, err := transport.ProbeLAN(cfg.LAN.Address)
+		if err != nil {
+			return err
+		}
+		cfg.LAN.Enabled = true
+		cfg.LAN.Port = *port
+		if err := config.Save(cfg); err != nil {
+			return err
+		}
+		fmt.Printf("LAN tier on: %s (%s)\n", lan.URL(cfg.LAN.Port), lan.Iface)
+		fmt.Println("Plain HTTP, so no app install and no notifications on this path.")
+		if hint := lan.FirewallHint(cfg.LAN.Port); hint != "" {
+			fmt.Printf("\n%s\n", hint)
+		}
+
+	case "off":
+		cfg.LAN.Enabled = false
+		if err := config.Save(cfg); err != nil {
+			return err
+		}
+		fmt.Println("LAN tier off.")
+
+	default:
+		fmt.Print(lanUsage)
+		return fmt.Errorf("unknown lan command %q", args[0])
+	}
+
+	restartDaemon()
+	return nil
+}
+
+// restartDaemon reloads the unit if it is running, so a config change is live.
+func restartDaemon() {
+	if err := exec.Command("systemctl", "--user", "is-active", "--quiet", "omarchy-connect").Run(); err != nil {
+		fmt.Println("The daemon is not running under systemd; restart it for this to take effect.")
+		return
+	}
+	if err := exec.Command("systemctl", "--user", "restart", "omarchy-connect").Run(); err != nil {
+		fmt.Println("Could not restart the daemon; restart it for this to take effect.")
+		return
+	}
+	fmt.Println("Daemon restarted.")
 }

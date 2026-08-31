@@ -15,6 +15,11 @@ Panel {
   property bool cursorActive: false
   property string renamingId: ""
 
+  // Which QR is on screen. Defaults to the tailnet one because it is the better
+  // origin -- https, so the page can install as an app -- and switching is one
+  // tap for the case it cannot serve.
+  property string qrSource: "tailnet"
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color accent: Color.accent
@@ -57,6 +62,7 @@ Panel {
     } else {
       cursorActive = false
       renamingId = ""
+      qrSource = "tailnet"
       service.clearPairing()
       if (panelFlick) panelFlick.contentY = 0
     }
@@ -148,6 +154,10 @@ Panel {
         if (key === "x" && d) { service.revoke(d); return }
         if (key === "u" && d && d.blocked) { service.unblock(d); return }
         if (key === "y" && root.pairing) { service.copyPairUrl(); return }
+        if (key === "l" && root.pairing && service.lanQrSize > 0) {
+          root.qrSource = root.qrSource === "lan" ? "tailnet" : "lan"
+          return
+        }
       }
 
       Flickable {
@@ -313,6 +323,63 @@ Panel {
             }
           }
 
+          // ---------- LAN tier ----------
+
+          Column {
+            visible: service.installed
+            width: parent.width
+            spacing: Style.space(3)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                text: "LAN access"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Item { width: parent.width - lanToggle.width - Style.space(90); height: 1 }
+
+              ToggleSwitch {
+                id: lanToggle
+                anchors.verticalCenter: parent.verticalCenter
+                checked: service.lanEnabled
+                foreground: root.foreground
+                accent: root.accent
+                onToggled: service.setLan(!service.lanEnabled)
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: service.lanEnabled
+                    ? service.lanUrl + (service.lanServing ? "" : "  — not reachable")
+                    : "For phones with no Tailscale. Plain HTTP: no app install, no notifications."
+              color: service.lanEnabled && !service.lanServing ? root.urgent : root.dim
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // A bound socket is not a reachable one. Without this the QR scans,
+            // the phone hangs, and nothing anywhere says why.
+            Text {
+              visible: service.firewall !== ""
+              width: parent.width
+              text: service.firewall
+              color: root.urgent
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSeparator { visible: service.installed; width: parent.width }
+
           // ---------- pairing QR ----------
 
           Column {
@@ -320,32 +387,63 @@ Panel {
             width: parent.width
             spacing: Style.space(5)
 
+            readonly property bool showingLan: root.qrSource === "lan" && service.lanQrSize > 0
+            readonly property int activeSize: showingLan ? service.lanQrSize : service.qrSize
+            readonly property var activeRows: showingLan ? service.lanQrRows : service.qrRows
+
+            // Only offered when tier 2 is actually up. A switch that leads to a
+            // QR nobody can reach is worse than no switch.
+            Row {
+              visible: service.lanQrSize > 0
+              anchors.horizontalCenter: parent.horizontalCenter
+              spacing: Style.space(4)
+
+              Button {
+                text: "Tailnet"
+                bordered: true
+                selected: root.qrSource === "tailnet"
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onClicked: root.qrSource = "tailnet"
+              }
+              Button {
+                text: "No Tailscale on the phone"
+                bordered: true
+                selected: root.qrSource === "lan"
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onClicked: root.qrSource = "lan"
+              }
+            }
+
             Rectangle {
               id: qrCanvas
               anchors.horizontalCenter: parent.horizontalCenter
               // The quiet zone is baked into the matrix, so the white field
               // reaches the edge of the card and scanners see the full border.
-              readonly property int moduleSize: Math.max(3, Math.floor(Style.space(240) / Math.max(1, service.qrSize)))
-              width: moduleSize * service.qrSize
+              readonly property int moduleSize: Math.max(3, Math.floor(Style.space(240) / Math.max(1, parent.activeSize)))
+              width: moduleSize * parent.activeSize
               height: width
               color: "#ffffff"
               radius: Style.cornerRadius > 0 ? Style.space(4) : 0
 
               Grid {
                 anchors.centerIn: parent
-                columns: service.qrSize
+                columns: qrCanvas.parent.activeSize
 
                 Repeater {
-                  model: service.qrSize * service.qrSize
+                  model: qrCanvas.parent.activeSize * qrCanvas.parent.activeSize
 
                   Rectangle {
                     required property int index
-                    readonly property int matrixRow: Math.floor(index / service.qrSize)
-                    readonly property int matrixColumn: index % service.qrSize
+                    readonly property int matrixRow: Math.floor(index / qrCanvas.parent.activeSize)
+                    readonly property int matrixColumn: index % qrCanvas.parent.activeSize
 
                     width: qrCanvas.moduleSize
                     height: qrCanvas.moduleSize
-                    color: service.qrRows[matrixRow].charAt(matrixColumn) === "1" ? "#111111" : "transparent"
+                    color: qrCanvas.parent.activeRows[matrixRow].charAt(matrixColumn) === "1" ? "#111111" : "transparent"
                   }
                 }
               }
@@ -358,6 +456,31 @@ Panel {
                     ? "Scan it — expires in " + service.pairSecondsLeft + "s"
                     : "Expired"
               color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: parent.showingLan
+                    ? "Same wifi, no Tailscale needed. Plain HTTP, so it cannot install as an app."
+                    : "Needs Tailscale on the phone. Installs as an app."
+              color: root.dim
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // The exact failure this tier exists to fix, named where someone
+            // hits it: a phone off the tailnet cannot resolve a MagicDNS name.
+            Text {
+              visible: !service.lanEnabled
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              text: "Phone not on Tailscale? It will fail to resolve this name. Turn on the LAN tier below."
+              color: root.urgent
+              wrapMode: Text.WordWrap
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
@@ -506,8 +629,8 @@ Panel {
           Text {
             visible: service.installed
             width: parent.width
-            text: "j/k move · enter toggles typing · n rename · x " +
-                  "revoke · u unblock · p pair · r refresh"
+            text: "j/k move · enter toggles typing · n rename · x revoke · " +
+                  "u unblock · p pair · l switch QR · y copy link · r refresh"
             color: root.dim
             wrapMode: Text.WordWrap
             font.family: root.fontFamily

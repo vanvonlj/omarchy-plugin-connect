@@ -26,6 +26,15 @@ type Server struct {
 	version string
 	devices *device.Store
 	pairing *pairing.Store
+
+	// lan is nil when tier 2 is disabled or no address was found.
+	lan *transport.LAN
+}
+
+// WithLAN enables the tier-2 listener.
+func (s *Server) WithLAN(lan *transport.LAN) *Server {
+	s.lan = lan
+	return s
 }
 
 // New returns a server bound to a probed tailnet node.
@@ -33,8 +42,10 @@ func New(tn *transport.Tailnet, cfg config.Config, log *slog.Logger, version str
 	return &Server{tn: tn, cfg: cfg, log: log, version: version, devices: devices, pairing: pairs}
 }
 
-// Handler returns the tailnet request handler, admission included.
-func (s *Server) Handler() http.Handler {
+// routes is the shared route table. The two listeners serve identical routes
+// and differ only in how they identify a caller, which keeps tier 2 from
+// quietly drifting into a different API.
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
@@ -42,7 +53,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/me", s.handleMe)
 	mux.HandleFunc("POST /api/pair", s.handlePair)
 	mux.Handle("GET /", webui.Handler())
-	return s.identify(mux)
+	return mux
+}
+
+// Handler returns the tailnet request handler, admission included.
+func (s *Server) Handler() http.Handler {
+	return s.identify(s.routes())
+}
+
+// LANHandler returns the tier-2 handler, which accepts device tokens only.
+func (s *Server) LANHandler() http.Handler {
+	return s.identifyLAN(s.routes())
 }
 
 type health struct {
@@ -108,6 +129,35 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.log.Info("listening", "url", s.tn.URL(s.cfg.Port), "addrs", len(lns))
+
+	// Tier 2, when enabled. A failure here is logged and does not stop the
+	// daemon: losing the optional LAN listener must never take the tailnet
+	// listener down with it.
+	if s.lan != nil {
+		lanSrv := &http.Server{
+			Handler:           s.LANHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
+		}
+		lanLn, err := s.lan.Listen(ctx, s.cfg.LAN.Port)
+		if err != nil {
+			s.log.Error("LAN listener failed to bind; tier 2 is off", "err", err)
+		} else {
+			defer shutdown(lanSrv)
+			s.log.Info("listening on the LAN",
+				"url", s.lan.URL(s.cfg.LAN.Port), "iface", s.lan.Iface)
+			if hint := s.lan.FirewallHint(s.cfg.LAN.Port); hint != "" {
+				s.log.Warn("a firewall will drop LAN connections\n" + hint)
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := lanSrv.Serve(lanLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					s.log.Error("LAN listener stopped", "err", err)
+				}
+			}()
+		}
+	}
 
 	select {
 	case <-ctx.Done():

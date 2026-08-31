@@ -44,6 +44,19 @@ Item {
   property string pairExpires: ""
   property int pairSecondsLeft: 0
 
+  // The tier-2 QR, present only when the LAN listener is on. Kept separate from
+  // the tailnet one rather than replacing it: a phone that does have Tailscale
+  // should still be offered the https origin, which is the only one that can
+  // install as an app.
+  property var lanQrRows: []
+  property int lanQrSize: 0
+  property string lanPairUrl: ""
+
+  property bool lanEnabled: false
+  property string lanUrl: ""
+  property bool lanServing: false
+  property string firewall: ""
+
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 30, 5, 300)
   readonly property bool busy: statusProcess.running || devicesProcess.running || pairProcess.running || actionProcess.running
 
@@ -97,6 +110,14 @@ Item {
     pairUrl = ""
     pairExpires = ""
     pairSecondsLeft = 0
+    lanQrRows = []
+    lanQrSize = 0
+    lanPairUrl = ""
+  }
+
+  function setLan(on) {
+    runAction(["omarchy-connect", "lan", on ? "on" : "off"],
+              on ? "LAN tier on" : "LAN tier off")
   }
 
   function setWritable(device, writable) {
@@ -212,6 +233,10 @@ Item {
       root.certsAvailable = payload.certsAvailable === true
       root.port = parseInt(payload.port, 10) || 0
       root.serving = payload.serving === true
+      root.lanEnabled = payload.lanEnabled === true
+      root.lanUrl = String(payload.lanUrl || "")
+      root.lanServing = payload.lanServing === true
+      root.firewall = String(payload.firewall || "")
       root.problem = String(payload.problem || "")
     }
   }
@@ -283,6 +308,13 @@ Item {
       root.pairUrl = String(payload.url || "")
       root.pairExpires = String(payload.expires || "")
       root.pairSecondsLeft = Model.secondsUntil(root.pairExpires)
+
+      var lanMatrix = Model.parseQrMatrix(payload.lanMatrix)
+      if (lanMatrix.size > 0) {
+        root.lanQrRows = lanMatrix.rows
+        root.lanQrSize = lanMatrix.size
+        root.lanPairUrl = String(payload.lanUrl || "")
+      }
       root.lastError = ""
     }
   }

@@ -46,8 +46,13 @@ func (s *Server) identify(next http.Handler) http.Handler {
 			s.log.Debug("touch failed", "device", d.ID, "err", err)
 		}
 
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), deviceKey, d)))
+		next.ServeHTTP(w, withDevice(r, d))
 	})
+}
+
+// withDevice attaches the resolved device to a request.
+func withDevice(r *http.Request, d *device.Device) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), deviceKey, d))
 }
 
 func (s *Server) resolve(r *http.Request) (*device.Device, error) {

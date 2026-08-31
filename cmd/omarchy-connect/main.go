@@ -33,6 +33,7 @@ Usage:
   omarchy-connect status [--json]  report listeners, TLS, and preconditions
   omarchy-connect pair [--json]    show a QR code to pair a new device
   omarchy-connect devices ...      list, rename, promote, or revoke devices
+  omarchy-connect lan on|off       serve on the LAN too, for phones without Tailscale
   omarchy-connect version
 
 Settings live in ~/.config/omarchy/connect/config.json and are edited from the
@@ -55,6 +56,8 @@ func main() {
 		err = pairCmd(os.Args[2:])
 	case "devices":
 		err = devicesCmd(os.Args[2:])
+	case "lan":
+		err = lanCmd(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
@@ -109,7 +112,21 @@ func serve(args []string) error {
 		return err
 	}
 
-	return server.New(tn, cfg, log, version, devices, pairs).Run(ctx)
+	srv := server.New(tn, cfg, log, version, devices, pairs)
+
+	if cfg.LAN.Enabled {
+		lan, err := transport.ProbeLAN(cfg.LAN.Address)
+		if err != nil {
+			// Not fatal. The tailnet listener is the one that matters, and
+			// taking it down because an optional second listener could not find
+			// an address would be a poor trade.
+			log.Error("LAN tier is enabled but no address was found; serving tailnet only", "err", err)
+		} else {
+			srv = srv.WithLAN(lan)
+		}
+	}
+
+	return srv.Run(ctx)
 }
 
 type statusReport struct {
@@ -121,6 +138,10 @@ type statusReport struct {
 	CertsAvailable bool     `json:"certsAvailable"`
 	Port           int      `json:"port"`
 	LANEnabled     bool     `json:"lanEnabled"`
+	LANURL         string   `json:"lanUrl,omitempty"`
+	LANServing     bool     `json:"lanServing"`
+	LANProblem     string   `json:"lanProblem,omitempty"`
+	Firewall       string   `json:"firewall,omitempty"`
 	ConfigPath     string   `json:"configPath"`
 	Problem        string   `json:"problem,omitempty"`
 }
@@ -161,6 +182,17 @@ func status(args []string) error {
 		report.Serving = serving(tn, report.Port)
 	}
 
+	if cfg.LAN.Enabled {
+		lan, lanErr := transport.ProbeLAN(cfg.LAN.Address)
+		if lanErr != nil {
+			report.LANProblem = lanErr.Error()
+		} else {
+			report.LANURL = lan.URL(cfg.LAN.Port)
+			report.LANServing = dialable(lan.Addr.String(), cfg.LAN.Port)
+			report.Firewall = lan.FirewallHint(cfg.LAN.Port)
+		}
+	}
+
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -188,8 +220,11 @@ func serving(tn *transport.Tailnet, port int) bool {
 	if port == 0 || len(tn.Addrs) == 0 {
 		return false
 	}
-	addr := net.JoinHostPort(tn.Addrs[0].String(), strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
+	return dialable(tn.Addrs[0].String(), port)
+}
+
+func dialable(host string, port int) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 400*time.Millisecond)
 	if err != nil {
 		return false
 	}
@@ -220,8 +255,22 @@ func printStatus(r statusReport, probeErr error) {
 		fmt.Printf("             fix: admin console > DNS > HTTPS Certificates\n")
 	}
 
-	fmt.Printf("  lan tier   %s\n", enabledWord(r.LANEnabled))
+	if r.LANEnabled {
+		if r.LANProblem != "" {
+			fmt.Printf("  lan tier   enabled, but: %s\n", r.LANProblem)
+		} else {
+			fmt.Printf("  lan tier   %s  (%s)\n", r.LANURL, servingWord(r.LANServing))
+			fmt.Printf("             http only - no app install, no notifications\n")
+		}
+	} else {
+		fmt.Printf("  lan tier   disabled - phones without Tailscale cannot connect\n")
+		fmt.Printf("             enable with: omarchy-connect lan on\n")
+	}
 	fmt.Printf("  config     %s\n", r.ConfigPath)
+
+	if r.Firewall != "" {
+		fmt.Printf("\n  %s\n", r.Firewall)
+	}
 
 	if r.Problem != "" {
 		fmt.Printf("\n  problem    %s\n", r.Problem)
@@ -233,11 +282,4 @@ func servingWord(b bool) string {
 		return "yes"
 	}
 	return "no - nothing is listening"
-}
-
-func enabledWord(b bool) string {
-	if b {
-		return "enabled (HTTP only)"
-	}
-	return "disabled"
 }

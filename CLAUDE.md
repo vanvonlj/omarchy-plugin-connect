@@ -55,6 +55,17 @@ omarchy plugin validate .
   binary and never invokes `go` at runtime — but nothing at runtime may start
   depending on the toolchain being reachable, and a PKGBUILD must depend on
   system `go` rather than assuming this shim.
+- **A cookie's `Secure` flag must come from the request, not from config.**
+  Deciding it from "can the tailnet issue certificates" marks the tier-2 cookie
+  Secure, and a Secure cookie is never returned over an `http://` origin -- so a
+  phone pairs successfully and is then refused on every request afterwards. Use
+  `r.TLS != nil`.
+- **The LAN listener must never call `WhoIs`.** Source addresses on a LAN socket
+  are unverified, so a spoofed `100.x` source would resolve to a real tailnet
+  peer and be admitted tokenless. Tier 2 accepts device tokens only.
+- **Testing tier 2 with curl from this machine does not exercise the firewall.**
+  Traffic to a local address stays on loopback, which ufw allows by default. A
+  green curl says nothing about whether a phone can reach it.
 - **Never bind a listener to `0.0.0.0`.** Bind the specific tailnet address, and
   the specific LAN address only when LAN mode is explicitly enabled. This is a
   security property stated in the README, not an implementation detail.

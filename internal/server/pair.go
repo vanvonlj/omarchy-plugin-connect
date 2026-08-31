@@ -109,15 +109,20 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("paired", "device", d.ID, "name", d.Name, "capability", d.Capability)
 
 	// HttpOnly so page script cannot read the token; SameSite=Lax so it rides
-	// an ordinary navigation from the QR scan. Secure is set because the tailnet
-	// origin is HTTPS -- a cookie marked Secure is simply not sent over the
-	// plain-HTTP LAN tier, which is the correct outcome rather than a bug.
+	// an ordinary navigation from the QR scan.
+	//
+	// Secure is decided per request, from whether *this* connection is TLS --
+	// not from whether the tailnet can issue certificates. Keying it on the
+	// latter marks the tier-2 cookie Secure, and a Secure cookie is never sent
+	// back over an http:// origin, so a phone would pair successfully and then
+	// be refused on every subsequent request. The tailnet cookie is still
+	// Secure, which is the case that needs it.
 	http.SetCookie(w, &http.Cookie{
 		Name:     tokenCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.tn.CertsAvailable,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((365 * 24 * 60 * 60)),
 	})

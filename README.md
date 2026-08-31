@@ -56,6 +56,9 @@ satisfies it by leaning on the fact that **Tailscale is already that ladder**:
 | 1 | Tailscale, DERP relay | Hole-punching fails (symmetric NAT, hostile guest wifi) | same |
 | 2 | Plain LAN, no Tailscale | Opt-in, for a phone with no Tailscale installed | `http://<lan-ip>:7433` |
 
+Tier 2 is off by default and turned on from the panel, or with
+`omarchy-connect lan on`.
+
 Tiers 0 and 1 are the *same origin*. That is the point. Tailscale picks the
 direct UDP path on its own when your phone is on the house wifi, and silently
 falls back to a relay when you are on cellular — but the URL, the TLS
@@ -64,9 +67,33 @@ origin means one PWA install and one token store, and moving between wifi and
 cellular mid-session is a websocket reconnect rather than a re-pair.
 
 Tier 2 exists because "my phone does not have Tailscale on it" is a real
-situation, and it is honest about its costs: an HTTP origin is not a secure
-context, so no PWA install, no service worker, and no web push. It is off by
-default and gated behind pairing.
+situation. The symptom is specific and worth recognising: the tailnet QR fails
+with **`ERR_NAME_NOT_RESOLVED`**, because MagicDNS means nothing to a device
+that is not on the tailnet — the name has no resolver, so the request never
+leaves the phone.
+
+It is honest about its costs: an HTTP origin is not a secure context, so no PWA
+install, no service worker, and no web push. It is off by default and gated
+behind pairing.
+
+**Tier 2 has a different identity rule, and that is a security boundary rather
+than an omission.** The LAN listener never consults `WhoIs`. The tailnet path
+trusts Tailscale's assertion about a source address; on a LAN socket the source
+address is whatever arrived on the wire, so a packet bearing a spoofed `100.x`
+source would otherwise resolve to a real tailnet peer and be admitted with no
+token at all. On that listener a device token is the only evidence accepted, and
+the only routes reachable without one are the static page and the endpoint that
+redeems a pairing code — the code being the credential in both cases.
+
+**A bound socket is not a reachable one.** If a host firewall is running, the
+listener comes up, the QR scans, and the phone hangs with nothing in any log to
+explain it. The daemon detects this and prints the rule to add, scoped to the
+one interface rather than opening the port globally:
+
+```
+ufw is active and will drop LAN connections to port 7433. Allow them with:
+    sudo ufw allow in on wlp1s0 to any port 7433 proto tcp
+```
 
 **TLS on the tailnet is real TLS — once you enable it.** `tailscale cert`
 issues a Let's Encrypt certificate for the MagicDNS name, so there is no
