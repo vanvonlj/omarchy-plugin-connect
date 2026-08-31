@@ -49,8 +49,12 @@ omarchy plugin validate .
   directory will thrash the shell. Build in a working copy elsewhere (this
   repo, `~/Projects/omarchy-plugin-connect`) and install the binary out to
   `~/.local/bin`; keep the installed plugin a clean checkout.
-- **`go` is not currently installed on this machine.** Anything that needs to
-  compile has to install it first — do not assume `go build` will run.
+- **Go is installed via mise, not system-wide** (`~/.local/share/mise/shims/go`,
+  currently 1.27.0). It is on an interactive shell's PATH and is *not* on the
+  PATH of a systemd user unit. That is fine — the daemon ships as a static
+  binary and never invokes `go` at runtime — but nothing at runtime may start
+  depending on the toolchain being reachable, and a PKGBUILD must depend on
+  system `go` rather than assuming this shim.
 - **Never bind a listener to `0.0.0.0`.** Bind the specific tailnet address, and
   the specific LAN address only when LAN mode is explicitly enabled. This is a
   security property stated in the README, not an implementation detail.
