@@ -70,11 +70,22 @@ omarchy plugin validate .
   synthetic user must be an explicit refusal, not a comparison that happens to
   fall through. This tailnet has live tagged nodes (`tag:k8s`), so the case is
   reachable today, not hypothetical.
-- **`tailscale cert` fails on this tailnet right now** — HTTPS certificates are
-  not enabled in the admin console. Treat a missing certificate as a first-class
-  degraded state the daemon reports, not as an error path that aborts startup;
-  the terminal still works fine over HTTP on the tailnet, only the PWA and push
-  do not.
+- **Get certificates from `LocalClient.GetCertificate`, not from `tailscale
+  cert`.** It plugs directly into `tls.Config.GetCertificate` and handles fetch,
+  cache, and renewal in the handshake path. Shelling out to the CLI means owning
+  a renewal timer and a pair of files on disk for a 90-day certificate — a
+  standing bug waiting for a machine nobody logs into. Warm the cert at `serve`
+  so the first visitor does not pay the fetch.
+- **Still treat a missing certificate as a reportable degraded state**, not a
+  fatal startup error. Certs are working on this tailnet now, but an expired
+  trial, a revoked toggle, or a tailnet that never enabled them are all real,
+  and the terminal works fine over HTTP on the tailnet.
+- **The daemon runs as a systemd *user* unit, not as root.** This works because
+  `OperatorUser` is set to `lucas`, which is what makes the LocalAPI — `WhoIs`
+  and `GetCertificate` both — reachable without sudo. That is a load-bearing
+  precondition: if the operator is ever unset, admission and TLS both fail at
+  once. Check it explicitly at startup and say so plainly rather than failing
+  with a permissions error from two layers down.
 
 ## This machine's tailnet
 
@@ -90,6 +101,11 @@ Verified 2026-08-30, useful because every manual test names one of these.
 MagicDNS suffix is `tail18c58.ts.net`, so this host is
 `omarchy-starfighter.tail18c58.ts.net`. Several of these are offline most of
 the time; bring one up rather than substituting a different test.
+
+HTTPS certificates are enabled and verified: a Let's Encrypt ECDSA P-256 cert
+issues for the MagicDNS name, single SAN, 90-day validity. The single SAN is
+why tier 2 (plain LAN) can never be HTTPS — the certificate does not cover a
+LAN IP, and nothing will make it.
 
 ## House style
 

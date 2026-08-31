@@ -72,19 +72,27 @@ self-signed certificate to click through and no private CA to install on a
 phone: the two things that make every other self-hosted remote-terminal setup
 unpleasant on iOS.
 
-> **Prerequisite.** HTTPS certificates are off by default on a new tailnet.
-> On this one they are still off — `tailscale cert` currently answers
-> *"your Tailscale account does not support getting TLS certs"*. Turn them on
-> in the admin console under **DNS → HTTPS Certificates** (free, and MagicDNS
-> must already be on). Until that toggle is flipped there is no certificate to
-> serve, and the daemon degrades to HTTP over the tailnet.
+This is confirmed working on this tailnet: a genuine Let's Encrypt certificate
+(ECDSA P-256) for `omarchy-starfighter.tail18c58.ts.net`, 90-day validity.
+HTTPS certificates are off by default on a new tailnet and are enabled once, in
+the admin console under **DNS → HTTPS Certificates**.
 
-HTTP over the tailnet is not *insecure* — WireGuard still encrypts every byte
-end to end — but the browser does not know that, and an `http://` origin is not
-a secure context. That costs the PWA install, the service worker, and web push,
-which is most of what makes this pleasant on a phone. So the daemon treats a
-missing certificate as a degraded mode it reports loudly in `status` and in the
-plugin, not as a configuration it quietly accepts.
+**The daemon never shells out to `tailscale cert`, and never writes a
+certificate to disk.** Tailscale's `LocalClient.GetCertificate` is shaped to
+drop straight into `tls.Config.GetCertificate`, which means fetch, cache, and
+renewal-before-expiry all happen inside the TLS handshake path. A 90-day
+certificate otherwise implies a renewal timer, a file to keep in sync, and a
+class of "expired three weeks ago on a machine nobody logged into" bug. Wiring
+the handshake to the LocalAPI deletes all of it. The first handshake after
+startup pays the fetch, so the daemon warms it during `serve` rather than making
+the first visitor wait.
+
+If certificates are ever unavailable, the daemon still serves HTTP over the
+tailnet and reports the degradation in `status` and in the plugin. That path is
+not *insecure* — WireGuard encrypts every byte end to end regardless — but the
+browser cannot know that, and an `http://` origin is not a secure context, so
+the PWA install, the service worker, and web push are all lost. It is a
+fallback, not a supported configuration.
 
 ## Identity
 
@@ -168,7 +176,9 @@ that Omarchy installs, and the daemon source that it does not.
 
 Prerequisites: `tmux`, `go` (build only), and `tailscale` for anything past
 tier 2 — with **HTTPS certificates enabled** on the tailnet (admin console,
-**DNS → HTTPS Certificates**) for the PWA to install.
+**DNS → HTTPS Certificates**) for the PWA to install, and the Tailscale
+**operator set to your user** (`sudo tailscale set --operator=$USER`) so the
+daemon can reach the LocalAPI without root.
 
 ```bash
 # 1. the daemon
