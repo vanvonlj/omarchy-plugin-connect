@@ -66,10 +66,25 @@ situation, and it is honest about its costs: an HTTP origin is not a secure
 context, so no PWA install, no service worker, and no web push. It is off by
 default and gated behind pairing.
 
-**TLS on the tailnet is real TLS.** `tailscale cert` issues a Let's Encrypt
-certificate for the MagicDNS name, so there is no self-signed certificate to
-click through and no private CA to install on a phone — the two things that
-make every other self-hosted remote-terminal setup unpleasant on iOS.
+**TLS on the tailnet is real TLS — once you enable it.** `tailscale cert`
+issues a Let's Encrypt certificate for the MagicDNS name, so there is no
+self-signed certificate to click through and no private CA to install on a
+phone: the two things that make every other self-hosted remote-terminal setup
+unpleasant on iOS.
+
+> **Prerequisite.** HTTPS certificates are off by default on a new tailnet.
+> On this one they are still off — `tailscale cert` currently answers
+> *"your Tailscale account does not support getting TLS certs"*. Turn them on
+> in the admin console under **DNS → HTTPS Certificates** (free, and MagicDNS
+> must already be on). Until that toggle is flipped there is no certificate to
+> serve, and the daemon degrades to HTTP over the tailnet.
+
+HTTP over the tailnet is not *insecure* — WireGuard still encrypts every byte
+end to end — but the browser does not know that, and an `http://` origin is not
+a secure context. That costs the PWA install, the service worker, and web push,
+which is most of what makes this pleasant on a phone. So the daemon treats a
+missing certificate as a degraded mode it reports loudly in `status` and in the
+plugin, not as a configuration it quietly accepts.
 
 ## Identity
 
@@ -81,6 +96,13 @@ user. A peer owned by the same user as the device is admitted with no pairing
 step at all — this is what makes the **Omarchy → Omarchy** case a matter of
 opening a URL. Peers belonging to other tailnet members are refused unless
 explicitly allowed in the plugin.
+
+**Tagged nodes are never auto-admitted**, whatever the tailnet. A tagged node —
+a CI runner, a subnet router, a Kubernetes operator — is owned by an ACL tag
+rather than by a person, so "same user" is not a question that has an answer for
+it. `WhoIs` reports its tags and no user profile, and that is treated as a
+refusal rather than as a missing field to fall back on. A tagged node that
+should reach a shell can be paired by hand like any other device.
 
 **Everything else pairs.** The plugin panel shows a QR code carrying the URL
 plus a short-lived single-use code. The phone posts the code and receives a
@@ -145,7 +167,8 @@ that Omarchy installs, and the daemon source that it does not.
 ## Install
 
 Prerequisites: `tmux`, `go` (build only), and `tailscale` for anything past
-tier 2.
+tier 2 — with **HTTPS certificates enabled** on the tailnet (admin console,
+**DNS → HTTPS Certificates**) for the PWA to install.
 
 ```bash
 # 1. the daemon

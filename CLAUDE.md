@@ -65,6 +65,31 @@ omarchy plugin validate .
   only (badge visibility, refresh interval).
 - **Agent state detection is a heuristic and is allowed to be wrong.** Never
   gate a capability on it. The terminal is ground truth; the badge is a hint.
+- **`WhoIs` on a tagged node returns tags and no user profile.** Do not write
+  the admission check as "compare UserID to ours" — a tagged node's absent or
+  synthetic user must be an explicit refusal, not a comparison that happens to
+  fall through. This tailnet has live tagged nodes (`tag:k8s`), so the case is
+  reachable today, not hypothetical.
+- **`tailscale cert` fails on this tailnet right now** — HTTPS certificates are
+  not enabled in the admin console. Treat a missing certificate as a first-class
+  degraded state the daemon reports, not as an error path that aborts startup;
+  the terminal still works fine over HTTP on the tailnet, only the PWA and push
+  do not.
+
+## This machine's tailnet
+
+Verified 2026-08-30, useful because every manual test names one of these.
+
+| Node | Address | Identity | Role in testing |
+|---|---|---|---|
+| `omarchy-starfighter` | `100.98.170.119` | `luke-serv@outlook.com` | this device — the daemon host |
+| `omarchy-hp` | `100.73.104.114` | same user, Linux | the **Omarchy → Omarchy** target |
+| `iphone172` | `100.97.101.19` | same user, iOS | the phone target |
+| `local-network-connector` | `100.73.191.125` | `tag:k8s` | the tagged node that must be **refused** |
+
+MagicDNS suffix is `tail18c58.ts.net`, so this host is
+`omarchy-starfighter.tail18c58.ts.net`. Several of these are offline most of
+the time; bring one up rather than substituting a different test.
 
 ## House style
 
@@ -112,10 +137,15 @@ trusting this file if something stops loading.
 
 - `omarchy plugin validate .` — manifest and layout
 - `go test ./...` — daemon
-- Manual: `omarchy-connect serve` in a terminal, connect from a phone on the
-  tailnet, and from a second Omarchy box, and confirm both admission paths.
+- Manual: `omarchy-connect serve` in a terminal, connect from `iphone172` and
+  from `omarchy-hp`, and confirm both admission paths.
 - The Omarchy → Omarchy path is easy to break and easy to forget to test,
   because it is the one that needs no pairing. Test it on every auth change.
+- Every auth change also needs the negative test: `local-network-connector`
+  (`tag:k8s`) must be refused. An admission bug that only shows up as "a tagged
+  node got a shell" is not one you want to find in production.
+- The tailnet listener can be built and unit-tested against a faked LocalAPI.
+  Do not let the absence of a second running box block progress on it.
 
 ## Committing
 
