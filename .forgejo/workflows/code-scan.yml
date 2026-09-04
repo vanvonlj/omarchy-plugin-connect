@@ -1,0 +1,353 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/workflows/
+# Edit it there and re-run `ops/forgejo-ci/rollout.py apply --yes`. A local edit here
+# is reported as drift by `rollout.py check` and overwritten on the next apply.
+
+name: Code scan
+
+# Self-hosted SAST + SCA + IaC misconfiguration. Everything runs inside the job
+# container: your code never leaves the network, there is no account, no API key
+# and nothing metered. The only outbound traffic is rule and vulnerability
+# metadata coming IN — semgrep's ruleset registry and the OSV/deps.dev API.
+#
+# This is the third layer of scanning, and it is deliberately the only one that
+# is not a hard gate:
+#
+#   secret-scan.yml   secrets          every push, every branch   FAILS the build
+#   trivy-operator    running images   in-cluster, continuous     alerts
+#   code-scan.yml     source + deps    pull requests              mostly reports
+#
+# WHY NOT ON EVERY PUSH, when secret-scan is. Runner capacity is 2 and this job
+# installs ~400MB of tooling per run, because the runner's cache server is
+# disabled (see rke2/forgejo/11-runner-configmap.yaml). Per-push would
+# monopolise the queue for no benefit: a secret appears the moment it is
+# committed, but a dependency CVE is not a property of your commit at all — it
+# lands when somebody else publishes an advisory against code nobody touched.
+#
+# WHICH IS WHY THIS WANTS A PERIODIC RUN, AND WHY IT DOES NOT HAVE ONE YET.
+# A `schedule:` trigger here stops Forgejo registering the workflow AT ALL on
+# any branch that is not the default branch — not just the cron, the whole
+# file, `pull_request` included. Verified 2026-09-04: adding it produced no run
+# and no error, and removing it as the only change made the run appear.
+# Forgejo evaluates `pull_request` from the HEAD branch, so once this file is in
+# a repo every PR branch would carry that `schedule` and PR scanning would
+# silently stop. Hence: no schedule here.
+#
+# The periodic run therefore has to come from outside the file. The clean way is
+# a CronJob in the cluster calling the `workflow_dispatch` API across every repo
+# once a week — one place, no duplicated workflow, and immune to this quirk.
+# Until that exists, this scans on pull requests only, and a CVE published
+# against an untouched repo will not surface on its own.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  code-scan:
+    # Needs python3 for semgrep, so this is the catthehacker image rather than
+    # the smaller `docker` (node:22-bookworm) label that secret-scan uses.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Scanners read the working tree, not history.
+          fetch-depth: 1
+
+      - name: Install scanners
+        # All three pinned, for the reason secret-scan pins its own tools: an
+        # unpinned bump changes what counts as a finding and can turn every repo
+        # red with no commit having changed. Bump here, in the source of truth,
+        # and roll out once.
+        env:
+          OSV_VERSION: "2.5.1"
+          TRIVY_VERSION: "0.74.0"
+          SEMGREP_VERSION: "1.176.0"
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o "$HOME/.local/bin/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+          chmod +x "$HOME/.local/bin/osv-scanner"
+          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # A venv, not a bare `pip install`. This image is Ubuntu 24.04, whose
+          # python is PEP 668 "externally managed" — a plain pip install into it
+          # aborts. The alternative, --break-system-packages, does what it says.
+          python3 -m venv "$HOME/.venv-scan"
+          "$HOME/.venv-scan/bin/pip" install --quiet "semgrep==${SEMGREP_VERSION}"
+          echo "$HOME/.venv-scan/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/osv-scanner" --version
+          "$HOME/.local/bin/trivy" --version | head -1
+          "$HOME/.venv-scan/bin/semgrep" --version
+
+      - name: Prove the scanners actually detect something
+        # THIS STEP IS LOAD-BEARING. Both of these tools fail OPEN: they report
+        # a clean scan when they have nothing to scan with.
+        #
+        #   - semgrep downloads its rules from the registry at run time. If that
+        #     fetch yields nothing, semgrep runs zero rules over your code and
+        #     exits 0 with "no findings" — a green check meaning nothing at all.
+        #   - osv-scanner asks deps.dev over the network. No answer, no
+        #     vulnerabilities, same green check.
+        #
+        # So before trusting a clean result, scan something KNOWN BAD and
+        # confirm each tool flags it. Same principle as the `(betterleaks)`
+        # assertion in secret-scan.yml, and for the same reason: silence from a
+        # scanner is only evidence if the scanner is known to be awake.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/canary && cd /tmp/canary
+
+          # subprocess with shell=True — caught by p/security-audit.
+          printf 'import subprocess\ndef r(c):\n    subprocess.call("echo " + c, shell=True)\n' > canary.py
+
+          # lodash 4.17.11 has six advisories in OSV including a 9.1.
+          cat > package-lock.json <<'LOCK'
+          {
+            "name": "canary", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": {"name": "canary", "version": "1.0.0", "dependencies": {"lodash": "4.17.11"}},
+              "node_modules/lodash": {
+                "version": "4.17.11",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.11.tgz"
+              }
+            }
+          }
+          LOCK
+
+          echo "--- semgrep canary ---"
+          semgrep scan --config p/security-audit --metrics=off --quiet --json \
+            --output /tmp/canary-semgrep.json canary.py || true
+          python3 -c "
+          import json, sys
+          n = len((json.load(open('/tmp/canary-semgrep.json')) or {}).get('results') or [])
+          print(f'semgrep flagged {n} finding(s) in the canary')
+          if n == 0:
+              sys.exit('FAILED: semgrep found nothing in deliberately vulnerable code. '
+                       'Its rules did not load, so a clean scan of the real tree would '
+                       'be meaningless. Treat this as a failed scan, not a clean one.')
+          "
+
+          echo "--- osv-scanner canary ---"
+          osv-scanner scan source -L package-lock.json --format json \
+            --output-file /tmp/canary-osv.json || true
+          python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/canary-osv.json')) or {}
+          n = sum(len(p.get('vulnerabilities') or [])
+                  for r in (d.get('results') or [])
+                  for p in (r.get('packages') or []))
+          print(f'osv-scanner flagged {n} vulnerabilit(y/ies) in the canary')
+          if n == 0:
+              sys.exit('FAILED: osv-scanner found nothing against lodash 4.17.11, which '
+                       'has six known advisories. It could not reach its data source, so '
+                       'a clean scan of the real tree would be meaningless.')
+          "
+
+      - name: Dependency vulnerabilities (SCA)
+        # Reads lockfiles and manifests, asks OSV/deps.dev. Never runs your
+        # build, never executes project code.
+        #
+        # Per-repo tuning goes in `.osv-scanner.toml` at the repo root — an
+        # UNMANAGED path, same arrangement as `.rafterignore` for secret-scan.
+        # Use it to record a vulnerability you have assessed and accepted, with
+        # the reason next to it.
+        run: |
+          set -euo pipefail
+          # --allow-no-lockfiles: a repo with no dependencies at all (manifests,
+          # docs, shell) is a legitimate clean result, not an error.
+          osv-scanner scan source -r --allow-no-lockfiles --format json \
+            --output-file /tmp/osv.json . || true
+          test -s /tmp/osv.json
+
+      - name: Infrastructure misconfiguration
+        # Kubernetes manifests, Helm charts, Dockerfiles, Terraform. Uses
+        # trivy's checks bundle (a few MB from ghcr.io) — NOT the 116MB
+        # vulnerability DB, which is why this is affordable without a cache.
+        #
+        # Per-repo exclusions go in `.trivyignore` (unmanaged).
+        run: |
+          set -euo pipefail
+          trivy config --severity HIGH,CRITICAL --quiet --format json \
+            --output /tmp/trivy.json . || true
+          test -s /tmp/trivy.json
+
+      - name: Static analysis (SAST)
+        # Rule packs are the union of p/default, p/security-audit and
+        # p/owasp-top-ten — measured to give the widest coverage of the three
+        # combinations tried.
+        #
+        # KNOW WHAT THIS DOES AND DOES NOT CATCH. It reliably finds dangerous
+        # API usage: shell execution on a variable, pickle on untrusted bytes,
+        # a container with no USER. It does NOT do cross-function taint
+        # tracking, so a classic `req.query.id` concatenated into a SQL string
+        # passes clean — that analysis is semgrep's paid tier. Verified against
+        # a canary carrying both classes. Treat a clean SAST result as "no
+        # obvious dangerous calls", not "no injection bugs".
+        #
+        # Per-repo exclusions go in `.semgrepignore` (unmanaged).
+        #
+        # --metrics=off: no telemetry, and no code or findings leave the runner.
+        # Only the rule definitions come in.
+        run: |
+          set -euo pipefail
+          semgrep scan \
+            --config p/default --config p/security-audit --config p/owasp-top-ten \
+            --metrics=off --quiet --json --output /tmp/semgrep.json . || true
+          test -s /tmp/semgrep.json
+
+      - name: Summarise and gate
+        # THE GATE IS DELIBERATELY NARROW: only a CRITICAL dependency
+        # vulnerability (CVSS >= 9.0) fails the build. Everything else reports.
+        #
+        # That is not timidity, it is the difference between a scanner people
+        # read and one they learn to ignore. The first run of this workflow
+        # across these repos surfaces a genuine backlog — chem-check alone has
+        # ~140 dependency advisories and homelab-platform ~260 HIGH/CRITICAL
+        # misconfigurations. Failing on all of that would paint every repo
+        # permanently red on day one, and a permanently red check is the same
+        # as no check.
+        #
+        # The two gated categories are the ones that are BOUNDED and ACTIONABLE.
+        # Of chem-check's 32 affected packages only two sit at >= 9.0, and both
+        # have a fixed version published — that is a dependency bump, not a
+        # backlog. So yes, this gate will fail such a repo today, and that is
+        # the intent: a critical with a fix available is exactly the finding
+        # worth blocking on. The unbounded categories are report-only.
+        #
+        # Tighten it per repo as each backlog is triaged: lower FAIL_CVSS, or
+        # flip FAIL_ON_SAST_ERROR to 1 once a repo's SAST findings are at zero.
+        # To make a repo report-only while its backlog is worked through, set
+        # FAIL_CVSS above 10 — but do that per repo, and put it back.
+        env:
+          FAIL_CVSS: "9.0"
+          FAIL_ON_SAST_ERROR: "0"
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, sys
+
+          def load(p):
+              try:
+                  with open(p) as f:
+                      return json.load(f) or {}
+              except Exception:
+                  return {}
+
+          def lst(obj, key):
+              """A list at obj[key], treating a JSON null as empty.
+
+              None of these tools write `[]` for "nothing found" — they write
+              `null`, and `.get(key, [])` returns None for a key that exists
+              with a null value, not the default. osv-scanner does exactly this
+              on a repo with no lockfiles, which is most of the manifest repos
+              here. Same trap betterleaks sets in the secret scan.
+              """
+              return (obj or {}).get(key) or []
+
+          osv, trivy, sem = load('/tmp/osv.json'), load('/tmp/trivy.json'), load('/tmp/semgrep.json')
+          out = []
+          def emit(s=''):
+              print(s)
+              out.append(s)
+
+          # ---- dependencies -------------------------------------------------
+          worst, deps = 0.0, {}
+          for r in lst(osv, 'results'):
+              for p in lst(r, 'packages'):
+                  info = p.get('package') or {}
+                  key = (info.get('ecosystem', '?'), info.get('name', '?'), info.get('version', '?'))
+                  for g in lst(p, 'groups'):
+                      try:
+                          s = float(g.get('max_severity') or 0)
+                      except ValueError:
+                          s = 0.0
+                      worst = max(worst, s)
+                      cur = deps.get(key, (0.0, 0))
+                      deps[key] = (max(cur[0], s), cur[1] + 1)
+
+          emit('## Dependency vulnerabilities')
+          if not deps:
+              emit('No known vulnerabilities in the resolved dependencies.')
+          else:
+              emit(f'{len(deps)} affected package(s); highest CVSS {worst:.1f}.')
+              emit()
+              emit('| CVSS | Ecosystem | Package | Version | Advisories |')
+              emit('|---|---|---|---|---|')
+              for (eco, name, ver), (s, n) in sorted(deps.items(), key=lambda kv: -kv[1][0])[:25]:
+                  emit(f'| {s:.1f} | {eco} | {name} | {ver} | {n} |')
+              if len(deps) > 25:
+                  emit(f'| … | | {len(deps) - 25} more packages | | |')
+
+          # ---- misconfiguration ---------------------------------------------
+          mis = [(m.get('Severity', '?'), m.get('ID', '?'), m.get('Title', ''), r.get('Target', ''))
+                 for r in lst(trivy, 'Results')
+                 for m in lst(r, 'Misconfigurations')]
+          emit()
+          emit('## Infrastructure misconfiguration')
+          if not mis:
+              emit('No HIGH or CRITICAL misconfigurations.')
+          else:
+              crit = sum(1 for m in mis if m[0] == 'CRITICAL')
+              emit(f'{len(mis)} finding(s) — {crit} CRITICAL, {len(mis) - crit} HIGH.')
+              seen, rows = set(), []
+              for sev, cid, title, target in mis:
+                  if cid in seen:
+                      continue
+                  seen.add(cid)
+                  rows.append((sev, cid, title, target))
+              emit()
+              emit('| Severity | Check | Title |')
+              emit('|---|---|---|')
+              for sev, cid, title, _ in rows[:20]:
+                  emit(f'| {sev} | {cid} | {title} |')
+              if len(rows) > 20:
+                  emit(f'| … | | {len(rows) - 20} more distinct checks |')
+
+          # ---- SAST ----------------------------------------------------------
+          sres = lst(sem, 'results')
+          errs = sum(1 for x in sres if (x.get('extra') or {}).get('severity') == 'ERROR')
+          emit()
+          emit('## Static analysis')
+          if not sres:
+              emit('No findings. Note this covers dangerous API usage, not taint-tracked injection.')
+          else:
+              emit(f'{len(sres)} finding(s) — {errs} at ERROR severity.')
+              emit()
+              emit('| Severity | Rule | Location |')
+              emit('|---|---|---|')
+              for x in sorted(sres, key=lambda x: (x.get('extra') or {}).get('severity') != 'ERROR')[:20]:
+                  rule = x.get('check_id', '?').split('.')[-1]
+                  emit(f"| {(x.get('extra') or {}).get('severity')} | {rule} | "
+                       f"{x.get('path')}:{(x.get('start') or {}).get('line')} |")
+              if len(sres) > 20:
+                  emit(f'| … | {len(sres) - 20} more | |')
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a') as f:
+                  f.write('\n'.join(out) + '\n')
+
+          # ---- the gate ------------------------------------------------------
+          threshold = float(os.environ.get('FAIL_CVSS', '9.0'))
+          fail_sast = os.environ.get('FAIL_ON_SAST_ERROR', '0') == '1'
+          reasons = []
+          if worst >= threshold:
+              reasons.append(f'a dependency vulnerability at CVSS {worst:.1f} '
+                             f'(threshold {threshold})')
+          if fail_sast and errs:
+              reasons.append(f'{errs} ERROR-severity static-analysis finding(s)')
+
+          print()
+          if reasons:
+              sys.exit('FAILED: ' + ', and '.join(reasons) + '.\n'
+                       'Everything else above is reported, not gated. Fix the finding, or '
+                       'record an assessed exception in this repo\'s .osv-scanner.toml.')
+          print('PASSED the gate. Findings above are reported for triage, not blocking — '
+                'see the comments in this workflow for how to tighten it.')
+          PY
