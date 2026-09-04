@@ -1,0 +1,14 @@
+# Paths excluded from `rafter secrets` (root-level, plain gitignore-style
+# paths — the documented .rafter/.rafterignore form with `:Pattern Name`
+# qualifiers is silently ignored by CLI v0.10.0).
+#
+# Everything below is a VERIFIED false positive. Re-verify before adding to
+# this list — an entry here is a permanent hole in the CI backstop.
+
+# Vendored upstream xterm.js: a 289KB single-line minified UMD bundle. The
+# generic-api-key rule is an entropy check, and it matches the bundle's own
+# internal `TwoKeyMap` class name. There is no credential in this file, and
+# there cannot be one that we would recognise anyway — it is third-party build
+# output, so a real finding here would mean a compromised dependency, which is
+# a supply-chain question rather than a secret-scanning one.
+internal/webui/assets/xterm.js
