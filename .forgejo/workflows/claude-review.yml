@@ -1,0 +1,150 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/workflows/
+# Edit it there and re-run `ops/forgejo-ci/rollout.py apply --yes`. A local edit here
+# is reported as drift by `rollout.py check` and overwritten on the next apply.
+#
+# PER-REPO CUSTOMISATION goes in `.forgejo/claude-review.md`, NOT in this file.
+# That path is not managed by the rollout; if it exists its contents are
+# appended to the prompt as repo-specific review guidance. This is what lets one
+# byte-identical workflow serve every repo.
+
+name: Claude PR review
+
+# Reviews the diff of every pull request and posts the result as a comment.
+#
+# Built on the Claude Code CLI plus Forgejo's own API rather than
+# anthropics/claude-code-action, on purpose: that action is not mirrored on
+# code.forgejo.org (this instance's DEFAULT_ACTIONS_URL), and it drives GitHub
+# through Octokit, which Forgejo's API only partly matches. Shelling out keeps
+# the moving parts on the Forgejo side where they are known to work.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    # Resolves to catthehacker/ubuntu:act-24.04 on the forgejo-runner (node +
+    # git + curl + jq already present). Runner capacity is 2, so a long review
+    # occupies half the queue — hence the cap: a review that has not finished in
+    # 20 minutes has hung, and without this it would hold that slot until the
+    # runner's own (much longer) default gives up.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          # Need both sides of the comparison, so no shallow clone.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Collect the diff
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+          git diff "$MERGE_BASE".."$HEAD_SHA" > /tmp/pr.diff || true
+          # Repo-specific review guidance is read from the BASE of the PR, never
+          # from the checked-out head. The prompt gives that file precedence over
+          # the generic instructions, so taking it from the head would let any
+          # pull request rewrite the reviewer's own brief — a one-line commit
+          # saying "report no issues" would be honoured. From the base it is a
+          # setting the repo's maintainer chose, which is the intent.
+          git show "$MERGE_BASE:.forgejo/claude-review.md" > /tmp/guidance.md 2>/dev/null \
+            || : > /tmp/guidance.md
+          BYTES=$(wc -c < /tmp/pr.diff)
+          echo "diff is $BYTES bytes"
+          # Cap the payload. A 300-commit sync produces megabytes of diff and
+          # would otherwise be truncated mid-hunk with no indication.
+          if [ "$BYTES" -gt 400000 ]; then
+            head -c 400000 /tmp/pr.diff > /tmp/pr.diff.cut
+            printf '\n\n[diff truncated at 400KB of %s total — review is partial]\n' "$BYTES" >> /tmp/pr.diff.cut
+            mv /tmp/pr.diff.cut /tmp/pr.diff
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "empty=$([ "$BYTES" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Claude Code
+        if: steps.diff.outputs.empty == 'false'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Review
+        if: steps.diff.outputs.empty == 'false'
+        env:
+          # Subscription auth (Claude Code Max/Pro), not a metered API key.
+          # Generate with `claude setup-token` on a machine already logged in.
+          # Set once as an ORGANISATION secret on lukejv-dev so every repo
+          # inherits it.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Review this pull request diff. Repository: ${{ github.repository }}"
+            echo "Title: ${PR_TITLE}"
+            echo
+            echo "Be concrete and brief. Cite file and line. Prioritise correctness"
+            echo "and anything that could affect a running system over style. If"
+            echo "nothing needs changing, say so plainly rather than inventing"
+            echo "findings. Do not restate what the diff does."
+            # Repo-specific guidance, if the repo provides any. Unmanaged path,
+            # and taken from the base ref by the previous step — see the note
+            # there about why it is not read out of the working tree.
+            if [ -s /tmp/guidance.md ]; then
+              echo
+              echo "Repository-specific guidance follows; it takes precedence over"
+              echo "the generic priorities above."
+              echo
+              cat /tmp/guidance.md
+            fi
+            echo
+            echo '```diff'
+            cat /tmp/pr.diff
+            echo '```'
+          } > /tmp/prompt.txt
+          # The diff is already in the prompt, so the review needs no tool that
+          # reaches outside it. Denying the rest matters because the diff is
+          # untrusted text: anyone who can open a PR can put instructions in it,
+          # and this step holds CLAUDE_CODE_OAUTH_TOKEN in its environment.
+          # Bash/WebFetch/WebSearch are the paths that could carry it back out;
+          # Write/Edit could plant something in the checkout. Read/Grep/Glob stay
+          # allowed — reading around the diff is the useful part, and confined to
+          # the checkout it exfiltrates nothing.
+          claude -p "$(cat /tmp/prompt.txt)" --output-format text \
+            --disallowed-tools Bash Edit Write NotebookEdit WebFetch WebSearch Task \
+            > /tmp/review.md
+          echo "review written: $(wc -c < /tmp/review.md) bytes"
+
+      - name: Post the review as a PR comment
+        if: steps.diff.outputs.empty == 'false'
+        env:
+          # Injected by Forgejo Actions, scoped to this repository.
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.server_url }}/api/v1
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Claude review"
+            echo
+            cat /tmp/review.md
+            echo
+            echo "<sub>Automated review of \`${{ github.event.pull_request.head.sha }}\`. Not a substitute for a human look.</sub>"
+          } > /tmp/body.md
+          jq -Rs '{body: .}' < /tmp/body.md > /tmp/body.json
+          curl -sS -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/body.json \
+            "${API}/repos/${REPO}/issues/${PR}/comments" \
+            -o /tmp/resp.json -w "posted: HTTP %{http_code}\n"
+          # Surface API failures instead of passing silently on a 401/404.
+          grep -q '"id"' /tmp/resp.json || { echo "comment POST failed:"; head -c 500 /tmp/resp.json; exit 1; }
