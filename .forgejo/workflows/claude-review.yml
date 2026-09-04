@@ -117,9 +117,16 @@ jobs:
           # Write/Edit could plant something in the checkout. Read/Grep/Glob stay
           # allowed — reading around the diff is the useful part, and confined to
           # the checkout it exfiltrates nothing.
-          claude -p "$(cat /tmp/prompt.txt)" --output-format text \
+          #
+          # The prompt goes in on STDIN, not as an argv. Linux caps a SINGLE
+          # argument at MAX_ARG_STRLEN (128KB), independent of the total argv
+          # limit, so `claude -p "$(cat /tmp/prompt.txt)"` dies with
+          # "Argument list too long" on any diff over roughly that size — which
+          # a 162KB diff duly did on the first live run. Stdin has no such cap,
+          # so the 400KB budget set above is the only limit that applies.
+          claude -p --output-format text \
             --disallowed-tools Bash Edit Write NotebookEdit WebFetch WebSearch Task \
-            > /tmp/review.md
+            < /tmp/prompt.txt > /tmp/review.md
           echo "review written: $(wc -c < /tmp/review.md) bytes"
 
       - name: Post the review as a PR comment
