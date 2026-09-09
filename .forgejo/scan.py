@@ -6,7 +6,8 @@
 """One command for all four scanners, run identically on a laptop and in CI.
 
     scan.py                     everything, whole tree
-    scan.py --diff              only what this branch introduced vs origin/main
+    scan.py --diff              only what this branch introduced, vs the repo's
+                                default branch (origin/HEAD, not always main)
     scan.py --diff HEAD~3       ... vs any ref
     scan.py --only secrets      one layer
     scan.py --history           secrets across all git history
@@ -25,7 +26,9 @@ WHAT EACH LAYER ACTUALLY COVERS — read this before trusting a clean result:
            `postgresql://user:pass@host/db` shape unless this repo carries a
            .betterleaks.toml rule for them — that gap hid four real leaks once.
   deps     osv-scanner against lockfiles. A repo with no lockfile is reported
-           as UNCOVERED, not clean — see scan_deps().
+           as UNCOVERED, not clean — and where the repo clearly HAS dependencies
+           (a .csproj, a pyproject.toml) but no lockfile, that uncovered result
+           fails the run rather than passing with a note. See scan_deps().
   iac      trivy config. Kubernetes, Helm, Dockerfile, Terraform.
   sast     semgrep OSS rules. Catches dangerous API usage — shell execution on
            a variable, pickle on untrusted bytes, a container with no USER. Does
@@ -39,6 +42,7 @@ print nothing. That is why --canary runs by default; think hard before turning t
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import shutil
@@ -65,6 +69,31 @@ EXTRA_BINS = [Path.home() / ".rafter/bin", Path.home() / ".local/bin"]
 
 NEEDS = {"secrets": "betterleaks", "deps": "osv-scanner",
          "iac": "trivy", "sast": "semgrep"}
+
+# --diff with no argument resolves to the repo's default branch at runtime.
+AUTO_BASE = "@default"
+
+# Ecosystems whose lockfile is OPTIONAL. osv-scanner only reads lockfiles, so a
+# repo here reports clean because nothing was READ, not because nothing is
+# wrong. Observed on a .NET repo using NuGet central package management: every
+# `dotnet build` printed NU1903 for a known-high advisory while this layer said
+# clean. The compiler was the better dependency scanner. Detecting one of these
+# with no lockfile is the difference between "no dependencies" and "dependencies
+# nobody looked at", so it fails instead of leaving a note nobody reads.
+_DOTNET = ("a .NET project with no packages.lock.json — set "
+           "<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile> in "
+           "Directory.Build.props and run `dotnet restore`")
+LOCKLESS_MANIFESTS = [
+    ("Directory.Packages.props", _DOTNET),
+    ("*.csproj", _DOTNET),
+    ("*.fsproj", _DOTNET),
+    ("pyproject.toml", "a Python project with no lockfile — commit a uv.lock, "
+                       "poetry.lock or requirements.txt"),
+    ("Gemfile", "a Ruby project with no Gemfile.lock — run `bundle lock`"),
+]
+
+SKIP_DIRS = {".git", "node_modules", "vendor", "bin", "obj", "target",
+             "dist", "build", ".venv", "venv"}
 
 
 class Finding:
@@ -116,6 +145,40 @@ def load_json(path):
 
 def lst(obj, key):
     return (obj or {}).get(key) or []
+
+
+def default_base(root):
+    """The remote's default branch — which is NOT always main.
+
+    A git-flow repo lands every change on origin/develop and keeps origin/main
+    as "what has been released". Diffing a feature branch against main there
+    reports everything merged since the last release as introduced by this
+    change: observed as 3 MEDIUM findings in workflow files a four-file branch
+    never touched. Since --diff gates HARD on newly-introduced HIGH/CRITICAL,
+    the wrong base fails your branch for somebody else's commit, and the report
+    gives the reader no reason to suspect the base. A gate that cries wolf gets
+    ignored, which costs more than the findings it was meant to catch.
+
+    origin/HEAD is written at clone time and can be stale or missing —
+    `git remote set-head origin -a` refreshes it. Falls back to origin/main.
+    """
+    rc, so, _ = run(["git", "-C", str(root), "symbolic-ref",
+                     "refs/remotes/origin/HEAD"])
+    ref = so.strip()
+    if rc == 0 and ref.startswith("refs/remotes/"):
+        return ref[len("refs/remotes/"):]
+    return "origin/main"
+
+
+def lockless_manifest(root):
+    """First dependency manifest whose lockfile is optional. (path, hint)."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in sorted(filenames):
+            for pat, hint in LOCKLESS_MANIFESTS:
+                if fnmatch.fnmatch(name, pat):
+                    return rel(Path(dirpath) / name, root), hint
+    return None, None
 
 
 def rel(p, root):
@@ -274,6 +337,12 @@ def scan_deps(tools, root, out):
     Reports UNCOVERED rather than clean when no lockfile was found. "Nothing to
     scan" and "nothing wrong" are different answers, and osv-scanner's own
     --allow-no-lockfiles collapses them into a cheerful exit 0.
+
+    Returns (findings, note, uncovered). `uncovered` is True only when the repo
+    plainly HAS dependencies and none of them were read — see
+    LOCKLESS_MANIFESTS. That case is a one-line repo config fix, not a triage
+    backlog, so main() fails on it. A repo with no dependency manifests at all
+    still gets the note and still passes.
     """
     run([tools["osv-scanner"], "scan", "source", "-r", "--allow-no-lockfiles",
          "--format", "json", "--output-file", str(out), str(root)])
@@ -293,28 +362,71 @@ def scan_deps(tools, root, out):
                 sev = ("CRITICAL" if score >= 9 else "HIGH" if score >= 7
                        else "MEDIUM" if score >= 4 else "LOW")
                 ids = g.get("ids") or ["?"]
-                rel = os.path.relpath(src, str(root)) if src else "?"
                 findings.append(Finding(
                     "deps", sev, ids[0],
                     f"{info.get('name','?')} {info.get('version','')} "
-                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}", rel))
-    note = None
+                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}",
+                    rel(src, root) if src else "?"))
+    note, uncovered = None, False
     if not sources:
-        note = ("no lockfile found, so NOTHING was checked for dependency "
-                "vulnerabilities — uncovered, not clean")
-    return findings, note
+        # ponytail: only checked when osv-scanner read NO lockfile at all. A
+        # repo mixing a package-lock.json with an unlocked .csproj still looks
+        # covered. Per-ecosystem coverage if that combination shows up.
+        manifest, hint = lockless_manifest(root)
+        if manifest:
+            note = (f"NOTHING was checked for dependency vulnerabilities: "
+                    f"{manifest} is {hint}")
+            uncovered = True
+        else:
+            note = ("no lockfile found, so NOTHING was checked for dependency "
+                    "vulnerabilities — uncovered, not clean")
+    return findings, note, uncovered
 
 
-def scan_iac(tools, root, out):
+def changed_files(root, diff_ref):
+    """Files this change touched, relative to the scan root.
+
+    Diffed against the WORKING TREE, not HEAD, and untracked files added on
+    top: this filters a whole-tree trivy run, so it has to name what trivy
+    actually read. `ref..HEAD` would skip the file you just wrote and have not
+    committed — precisely the file `--diff` exists to check.
+
+    --relative so the paths line up with trivy's Target when the scan root is a
+    subdirectory; without it git prints repo-root-relative paths and nothing
+    matches, which would silently drop every IaC finding.
+    """
+    rc, so, _ = run(["git", "-C", str(root), "diff", "--name-only",
+                     "--relative", diff_ref])
+    if rc != 0:
+        return None
+    _, untracked, _ = run(["git", "-C", str(root), "ls-files", "--others",
+                           "--exclude-standard"])
+    return set(so.split()) | set(untracked.split())
+
+
+def scan_iac(tools, root, out, diff_ref):
+    """IaC misconfiguration.
+
+    trivy has no --baseline-commit, so in --diff mode this scans the whole tree
+    and then keeps only findings in files the change touched. Without that
+    filter --diff inherits the entire IaC backlog and fails on it: 279
+    pre-existing HIGH findings on a branch that touched four files, in a mode
+    whose whole premise is "everything here was introduced by this change".
+    A gate that fails for somebody else's commit gets switched off.
+    """
     run([tools["trivy"], "config", str(root), "--severity", "HIGH,CRITICAL",
          "--quiet", "--format", "json", "--output", str(out)])
     doc = load_json(out)
+    touched = changed_files(root, diff_ref) if diff_ref else None
     findings = []
     for r in lst(doc, "Results"):
+        target = r.get("Target", "?")
+        if touched is not None and target not in touched:
+            continue
         for m in lst(r, "Misconfigurations"):
             findings.append(Finding(
                 "iac", (m.get("Severity") or "INFO").upper(),
-                m.get("ID", "?"), m.get("Title", ""), r.get("Target", "?")))
+                m.get("ID", "?"), m.get("Title", ""), target))
     return findings, None
 
 
@@ -389,9 +501,11 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", default=".", help="directory to scan")
-    ap.add_argument("--diff", nargs="?", const="origin/main", metavar="REF",
-                    help="only what changed since REF (default origin/main). "
-                         "Applies to secrets and SAST; deps and IaC are "
+    ap.add_argument("--diff", nargs="?", const=AUTO_BASE, metavar="REF",
+                    help="only what changed since REF (default: the repo's "
+                         "default branch via origin/HEAD, which is not always "
+                         "main). Secrets and SAST scan the range; IaC scans the "
+                         "tree and reports only touched files; deps is "
                          "whole-tree either way.")
     ap.add_argument("--history", action="store_true",
                     help="secrets: scan all git history, not the working tree")
@@ -431,6 +545,8 @@ def main():
         return 2
 
     diff_ref = args.diff
+    if diff_ref == AUTO_BASE:
+        diff_ref = default_base(root)
     if diff_ref:
         rc, _, _ = run(["git", "-C", str(root), "rev-parse", "--verify",
                         "--quiet", diff_ref])
@@ -442,7 +558,7 @@ def main():
     if not args.no_canary:
         canary(tools, layers, args.quiet)
 
-    findings, notes = [], {}
+    findings, notes, deps_uncovered = [], {}, False
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out.json"
         if "secrets" in layers:
@@ -450,11 +566,11 @@ def main():
             findings += f
             notes["secrets"] = n
         if "deps" in layers:
-            f, n = scan_deps(tools, root, out)
+            f, n, deps_uncovered = scan_deps(tools, root, out)
             findings += f
             notes["deps"] = n
         if "iac" in layers:
-            f, n = scan_iac(tools, root, out)
+            f, n = scan_iac(tools, root, out, diff_ref)
             findings += f
             notes["iac"] = n
         if "sast" in layers:
@@ -495,6 +611,11 @@ def main():
     if crit and args.fail_cvss <= 10:
         reasons.append(f"{len(crit)} dependency vulnerabilit(y/ies) at "
                        f"CVSS >= {args.fail_cvss}")
+    # A repo with dependencies and no lockfile is not a backlog to triage, it
+    # is one line of repo config, so it fails. --fail-cvss above 10 already
+    # means "dependency gating off" and turns this off with it.
+    if deps_uncovered and args.fail_cvss <= 10:
+        reasons.append(notes["deps"])
     for layer in args.fail_on:
         n = sum(1 for f in findings if f.layer == layer)
         if n:

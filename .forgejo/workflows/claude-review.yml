@@ -33,7 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        # Pinned to a SHA, not the mutable v4 tag (which is a branch
+        # tip on the mirror and can move under us). This SHA is
+        # code.forgejo.org/actions/checkout, the instance's
+        # DEFAULT_ACTIONS_URL — a github.com SHA does not exist there.
         with:
           # Need both sides of the comparison, so no shallow clone.
           fetch-depth: 0
