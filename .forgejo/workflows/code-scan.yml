@@ -49,11 +49,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        # Pinned to a SHA, not the mutable v4 tag (which is a branch
-        # tip on the mirror and can move under us). This SHA is
-        # code.forgejo.org/actions/checkout, the instance's
-        # DEFAULT_ACTIONS_URL — a github.com SHA does not exist there.
+        uses: actions/checkout@v4
         with:
           # Full history: the secrets layer can walk a commit range, and --diff
           # needs the base commit to exist locally.
