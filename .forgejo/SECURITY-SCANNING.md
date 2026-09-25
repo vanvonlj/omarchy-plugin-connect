@@ -35,7 +35,7 @@ pre-existing findings; a diff has no backlog, so everything in it is yours.
 | `PASSED — but deps was not actually covered` | no lockfile found, so nothing was checked. **Uncovered, not clean.** |
 | `CANARY FAILED` | the scan is broken, not clean. Never read it as a pass. |
 
-That last row is the important one. Every tool here **fails open**: semgrep with
+That last row is the important one. Every tool here **fails open**: opengrep with
 no rules, osv-scanner with no network, trivy with no checks bundle and
 betterleaks with a stale binary all exit 0 and print nothing. The canary scans
 deliberately-bad code first and fails if any tool calls it clean, which is the

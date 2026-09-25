@@ -126,14 +126,55 @@ Review this pull request diff. Repository: {repo}
 Title: {title}
 
 Report only what a reviewer would actually ask to be changed. Prioritise
-correctness and anything that could affect a running system over style. An empty
-findings list is a valid, good answer — do not invent findings to fill it, and do
-not restate what the diff does.
+correctness and anything that could affect a running system over style. Do not
+invent findings to fill space, and do not restate what the diff does.
+
+REVIEW THE WHOLE CHANGE, NOT ITS HIGHLIGHTS. Work through every file the diff
+touches. Stopping after the two or three most obvious problems is the failure
+mode here: it drips one issue per push and the author pays for another round
+trip to learn the rest, so a partial review is worse than a slow one.
+
+READ AROUND THE DIFF. You have Read, Grep and Glob over the checkout, and a hunk
+in isolation is not enough to judge one. Before reporting — or clearing — a
+change, look at what it depends on: the callers of a function whose contract
+moved, the other implementations of an interface, the tests that cover it, the
+comments and docs that describe it. Most real defects are only visible from
+outside the hunk.
+
+Sweep these, in this order, and record what each one found in `checked`:
+
+  1. CORRECTNESS — wrong results, broken edge cases, off-by-one, unhandled
+     None/null/empty, races, resource leaks.
+  2. CONTRACTS AND CALLERS — did this change a signature, a return shape, a
+     default, an exit code or an invariant? Grep for who depends on it. A
+     caller left on the old assumption is the most common real bug.
+  3. CLAIMS THE DIFF ITSELF INVALIDATES — comments, docstrings, type docs,
+     READMEs and error strings that were true before this change and are false
+     after it, especially ones edited in this same diff.
+  4. TESTS — do the new or changed tests actually fail when the code is wrong?
+     Assertions that hold by construction, a mock that makes the assertion
+     vacuous, a skipped or filtered-out case, a missing negative/control case.
+  5. ERROR AND FAILURE PATHS — what happens on timeout, non-zero exit, a denied
+     permission, a partial write, an empty response. Silent fallbacks that turn
+     a failure into a plausible-looking success.
+  6. CONFIG, ENVIRONMENT AND SECURITY — env vars and config read but not
+     validated, secrets or tokens in logs or error text, injection through a
+     shell or query, a widened permission, a new dependency.
+
+An empty findings list is a valid, good answer — but only once every item above
+has actually been looked at. Say so per item in `checked`; "nothing found" for
+a dimension you examined is a useful answer, and `checked` is how the author
+can tell that apart from a dimension you skipped.
 
 Answer with ONE JSON object and nothing else. No prose before or after, no
 markdown fence:
 
 {{"summary": "<=3 sentences on the change as a whole, or why it is fine",
+  "checked": [
+    {{"area": "correctness" | "contracts" | "stale-claims" | "tests"
+             | "failure-paths" | "config-security",
+      "note": "<=15 words: what you looked at, and what you concluded"}}
+  ],
   "findings": [
     {{"path": "exact/path/from/the/diff",
       "line": <line number in the NEW file, must be a line this diff touches>,
@@ -289,6 +330,19 @@ def summary(result, inline, demoted, repeats, truncated, head):
         out += [f"- `{f['path']}`"
                 + (f":{f['line']}" if isinstance(f.get("line"), int) else "")
                 + f" — {f['title']}: {f['body'].strip()}" for f in demoted]
+    # The coverage sweep, folded away. Posted because a claim you can see is a
+    # claim you can call out: "nothing found in tests" next to a PR that added
+    # a vacuous assertion tells the author the reviewer looked and was wrong,
+    # which is actionable. An unposted sweep is one the model can quietly skip.
+    areas = [c for c in result.get("checked", [])
+             if isinstance(c, dict) and c.get("area")]
+    if areas:
+        out += ["", "<details><summary>What was checked</summary>", ""]
+        for c in areas:
+            note = str(c.get("note", "")).strip()
+            out.append(f"- **{c['area']}**" + (f" — {note}" if note else ""))
+        out += ["", "</details>"]
+
     if repeats:
         out += ["", f"<sub>{repeats} finding(s) raised on an earlier push are not "
                     "repeated here.</sub>"]

@@ -7,8 +7,9 @@ name: Code scan
 
 # Self-hosted SAST + SCA + IaC misconfiguration. Everything runs inside the job
 # container: your code never leaves the network, there is no account, no API key
-# and nothing metered. The only outbound traffic is rule and vulnerability
-# metadata coming IN — semgrep's ruleset registry and the OSV/deps.dev API.
+# and nothing metered. The only outbound traffic is vulnerability metadata
+# coming IN — the OSV/deps.dev API. SAST rules are no longer fetched at all:
+# opengrep has no registry, so `.forgejo/sast-rules.yml` ships beside scan.py.
 #
 # THE SCANNING LOGIC IS NOT IN THIS FILE. It is `.forgejo/scan.py`, the same
 # file you run on a laptop, synced here by `rollout.py`. That is deliberate: a
@@ -21,10 +22,12 @@ name: Code scan
 #                            change introduced, and it gates HARD on that,
 #                            because in a diff there is no backlog to excuse
 #
-# WHY NOT ON EVERY PUSH, when secret-scan is. Runner capacity is 2 and this job
-# installs ~400MB of tooling per run, because the runner's cache server is
-# disabled (see rke2/forgejo/11-runner-configmap.yaml). Per-push would
-# monopolise the queue for no benefit: a secret appears the moment it is
+# WHY NOT ON EVERY PUSH, when secret-scan is. This job installs ~400MB of
+# tooling per run, because the runner's cache server is disabled (see
+# rke2/forgejo/17-runner-pool-configmap.yaml). Capacity is 10 concurrent jobs
+# as of 2026-09-10 — it was 2 when this rationale was written, on the single
+# runner since retired — so queue monopolisation is no longer the reason.
+# Per-push is still no benefit though: a secret appears the moment it is
 # committed, but a dependency CVE is not a property of your commit at all — it
 # lands when somebody else publishes an advisory against code nobody touched.
 #
@@ -44,7 +47,7 @@ on:
 
 jobs:
   code-scan:
-    # Needs python3, for semgrep and for scan.py itself.
+    # Needs python3 for scan.py itself; opengrep is a static binary.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -62,7 +65,7 @@ jobs:
         env:
           OSV_VERSION: "2.5.1"
           TRIVY_VERSION: "0.74.0"
-          SEMGREP_VERSION: "1.176.0"
+          OPENGREP_VERSION: "1.30.0"
           BETTERLEAKS_VERSION: "1.1.2"
         run: |
           set -euo pipefail
@@ -74,17 +77,18 @@ jobs:
             | tar xz -C "$HOME/.local/bin" trivy
           curl -sSL "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/betterleaks_${BETTERLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar xz -C "$HOME/.local/bin" betterleaks
+          # opengrep ships a static manylinux binary, so the SAST layer no
+          # longer needs a venv. semgrep was a pip install, and this image is
+          # Ubuntu 24.04 whose python is PEP 668 "externally managed" — that
+          # whole dance is gone with it.
+          curl -sSL -o "$HOME/.local/bin/opengrep" \
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          chmod +x "$HOME/.local/bin/opengrep"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # A venv, not a bare `pip install`. This image is Ubuntu 24.04, whose
-          # python is PEP 668 "externally managed" — a plain pip install aborts,
-          # and --break-system-packages does what it says.
-          python3 -m venv "$HOME/.venv-scan"
-          "$HOME/.venv-scan/bin/pip" install --quiet "semgrep==${SEMGREP_VERSION}"
-          echo "$HOME/.venv-scan/bin" >> "$GITHUB_PATH"
 
       - name: Scan
         # scan.py runs its own canaries first and fails if any tool reports
-        # deliberately-bad code as clean — semgrep with no rules, osv-scanner
+        # deliberately-bad code as clean — opengrep with no rules, osv-scanner
         # with no network, trivy with no checks bundle and betterleaks with a
         # stale binary all otherwise exit 0 and print nothing.
         #

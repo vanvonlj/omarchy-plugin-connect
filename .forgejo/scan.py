@@ -26,14 +26,19 @@ WHAT EACH LAYER ACTUALLY COVERS — read this before trusting a clean result:
            .betterleaks.toml rule for them — that gap hid four real leaks once.
   deps     osv-scanner against lockfiles. A repo with no lockfile is reported
            as UNCOVERED, not clean — see scan_deps().
-  iac      trivy config. Kubernetes, Helm, Dockerfile, Terraform.
-  sast     semgrep OSS rules. Catches dangerous API usage — shell execution on
-           a variable, pickle on untrusted bytes, a container with no USER. Does
-           NOT do cross-function taint tracking: `req.query.id` concatenated
-           into SQL passes clean. Measured against a canary carrying both, so
-           read a clean SAST result as "no obvious dangerous calls".
+  iac      trivy config. Kubernetes, Helm, Dockerfile, Terraform. trivy has
+           no --baseline-commit, so in --diff mode this layer filters its own
+           findings to files the change touched — see touched_paths().
+  sast     opengrep against the MIT ruleset in sast-rules.yml. Catches
+           dangerous API usage — shell execution on a variable, pickle on
+           untrusted bytes — and, with --taint-intrafile, tracks taint ACROSS
+           FUNCTIONS within one file. `req.query.id` reaching SQL through a
+           helper in the same file is caught; semgrep CE missed exactly that,
+           which is why this layer moved off it (measured 2026-09-11).
+           Still NOT cross-FILE: a source in a.py reaching a sink in b.py is
+           invisible. That is opengrep's paid-tier equivalent everywhere.
 
-EVERY TOOL HERE FAILS OPEN. semgrep with no rules, osv-scanner with no network,
+EVERY TOOL HERE FAILS OPEN. opengrep with no rules, osv-scanner with no network,
 trivy with no checks bundle and betterleaks with a stale binary all exit 0 and
 print nothing. That is why --canary runs by default; think hard before turning the canary off.
 """
@@ -53,7 +58,7 @@ VERSIONS = {
     "betterleaks": "1.1.2",
     "osv-scanner": "2.5.1",
     "trivy": "0.74.0",
-    "semgrep": "1.176.0",
+    "opengrep": "1.30.0",
 }
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
@@ -64,7 +69,14 @@ LAYERS = ["secrets", "deps", "iac", "sast"]
 EXTRA_BINS = [Path.home() / ".rafter/bin", Path.home() / ".local/bin"]
 
 NEEDS = {"secrets": "betterleaks", "deps": "osv-scanner",
-         "iac": "trivy", "sast": "semgrep"}
+         "iac": "trivy", "sast": "opengrep"}
+
+# opengrep has NO rules registry — p/default and friends resolve against
+# semgrep.dev and simply do not exist here. Rules ship beside this file and are
+# synced with it by rollout.py. A missing file is fatal rather than empty: an
+# empty ruleset scans clean, which is the exact fail-open this tool exists to
+# prevent.
+RULES = Path(__file__).resolve().parent / "sast-rules.yml"
 
 
 class Finding:
@@ -212,12 +224,12 @@ def canary(tools, layers, quiet):
                                 "running as root — its checks bundle did not load")
 
         if "sast" in layers:
-            run([tools["semgrep"], "scan", "--config", "p/security-audit",
-                 "--metrics=off", "--quiet", "--json", "--output", str(out),
+            run([tools["opengrep"], "scan", "--config", str(RULES),
+                 "--taint-intrafile", "--quiet", "--json", "--output", str(out),
                  str(d / "canary.py")])
             if len(lst(load_json(out), "results")) == 0:
-                problems.append("semgrep found nothing in a shell=True subprocess "
-                                "— its rules did not load")
+                problems.append("opengrep found nothing in a shell=True subprocess "
+                                f"— its rules did not load from {RULES}")
 
     if problems:
         sys.stderr.write("\nCANARY FAILED — this is not a clean scan, it is a "
@@ -305,16 +317,137 @@ def scan_deps(tools, root, out):
     return findings, note
 
 
-def scan_iac(tools, root, out):
+def touched_paths(root, diff_ref):
+    """Absolute paths this change touched: committed since diff_ref, staged,
+    unstaged, and untracked-but-not-ignored.
+
+    `trivy config` has no --baseline-commit, unlike betterleaks and opengrep, so
+    the iac layer has to do its own diffing. Filtering by path is sound here in
+    a way it would not be for sast: a misconfiguration finding is a pure
+    function of one file's content, so a file the change did not touch cannot
+    have gained one. (A rule-bundle bump can change the answer, but that is a
+    trivy version change, not a diff.)
+
+    Returns None if git cannot answer, which leaves the layer unfiltered — noisy
+    rather than silently empty.
+    """
+    rc, top, _ = run(["git", "-C", str(root), "rev-parse", "--show-toplevel"])
+    if rc != 0 or not top.strip():
+        return None
+    top = Path(top.strip())
+    paths = set()
+    # --full-name on ls-files is load-bearing: run from a subdirectory it
+    # otherwise prints paths relative to CWD ("velero/x.yaml"), while
+    # `diff --name-only` already prints them relative to the repo top
+    # ("rke2/velero/x.yaml"). Joining the cwd-relative form onto `top` yields a
+    # path that does not exist, so every untracked file silently drops out of
+    # the touched set — and a brand-new misconfigured manifest sails through the
+    # gate reporting "Nothing found".
+    for cmd in (["git", "-C", str(root), "diff", "--name-only", diff_ref],
+                ["git", "-C", str(root), "ls-files", "--others",
+                 "--exclude-standard", "--full-name"]):
+        rc, so, _ = run(cmd)
+        if rc != 0:
+            return None
+        for line in so.splitlines():
+            if line.strip():
+                paths.add((top / line.strip()).resolve())
+    return paths
+
+
+def base_iac_counts(tools, root, diff_ref, touched):
+    """{(target, rule): count} for the BASE version of each touched file.
+
+    trivy has no baseline, so we build one: check the pre-change content of
+    exactly the touched files out into a temp tree and scan that. Returns None
+    if the base cannot be materialised, which leaves findings unsubtracted —
+    noisy rather than silently empty, same failure direction as everywhere else.
+    """
+    rc, top, _ = run(["git", "-C", str(root), "rev-parse", "--show-toplevel"])
+    if rc != 0 or not top.strip():
+        return None
+    top = Path(top.strip())
+    counts = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        wrote = False
+        for abs_path in touched:
+            try:
+                rel_to_top = abs_path.relative_to(top)
+            except ValueError:
+                continue
+            rc, blob, _ = run(["git", "-C", str(root), "show",
+                               f"{diff_ref}:{rel_to_top.as_posix()}"])
+            if rc != 0:          # added by this change: no base, all findings new
+                continue
+            dst = tmp / rel_to_top
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(blob)
+            wrote = True
+        if not wrote:
+            return {}
+        out = tmp / "_base.json"
+        run([tools["trivy"], "config", str(tmp), "--severity", "HIGH,CRITICAL",
+             "--quiet", "--format", "json", "--output", str(out)])
+        doc = load_json(out)
+        for r in lst(doc, "Results"):
+            # Key by ABSOLUTE repo path, not by trivy's Target.
+            #
+            # trivy reports Target relative to the directory it was handed. The
+            # temp tree mirrors the repo from the GIT TOP, so these Targets are
+            # top-relative — but the head scan runs `trivy config <root>`, and
+            # root is the CLI's path argument, which defaults to cwd and need
+            # not be the git top. `cd rke2 && scan --diff` makes the head emit
+            # "velero/velero-values.yaml" while the base holds
+            # "rke2/velero/velero-values.yaml", nothing subtracts, and every
+            # pre-existing finding in a touched file reports as new — the
+            # permanently-red gate this whole function exists to prevent,
+            # reintroduced for any scan root that is not the repo root.
+            #
+            # Both sides resolve to the same absolute path, so they cannot drift.
+            target = r.get("Target", "?")
+            try:
+                key_path = (top / target).resolve()
+            except (OSError, ValueError):
+                continue
+            for m in lst(r, "Misconfigurations"):
+                key = (key_path, m.get("ID", "?"))
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def scan_iac(tools, root, out, diff_ref):
     run([tools["trivy"], "config", str(root), "--severity", "HIGH,CRITICAL",
          "--quiet", "--format", "json", "--output", str(out)])
     doc = load_json(out)
+    # In --diff mode the gate fails HARD on any new HIGH/CRITICAL. Without this
+    # filter trivy rescans the whole tree every run, every pre-existing finding
+    # counts as newly introduced, and the diff gate can never pass — the
+    # permanently-red check the gate comment below warns against.
+    touched = touched_paths(root, diff_ref) if diff_ref else None
+    # Touching a file is not the same as breaking it. Filtering to touched files
+    # alone would report that file's whole pre-existing backlog as newly
+    # introduced — measured: pinning authelia's image tag reported 3 HIGH
+    # findings that were identical on the base ref. So subtract what the base
+    # version of those same files already had, per (file, rule), by count.
+    base = base_iac_counts(tools, root, diff_ref, touched) if touched else None
     findings = []
     for r in lst(doc, "Results"):
+        target = r.get("Target", "?")
+        try:
+            abs_target = (Path(root) / target).resolve()
+        except (OSError, ValueError):
+            continue
+        if touched is not None and abs_target not in touched:
+            continue
         for m in lst(r, "Misconfigurations"):
+            rule = m.get("ID", "?")
+            if base is not None and base.get((abs_target, rule), 0) > 0:
+                base[(abs_target, rule)] -= 1   # already there before the change
+                continue
             findings.append(Finding(
                 "iac", (m.get("Severity") or "INFO").upper(),
-                m.get("ID", "?"), m.get("Title", ""), r.get("Target", "?")))
+                rule, m.get("Title", ""), target))
     return findings, None
 
 
@@ -322,9 +455,9 @@ SEMGREP_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
 
 
 def scan_sast(tools, root, out, diff_ref):
-    cmd = [tools["semgrep"], "scan", "--config", "p/default",
-           "--config", "p/security-audit", "--config", "p/owasp-top-ten",
-           "--metrics=off", "--quiet", "--json", "--output", str(out)]
+    # No --metrics flag: opengrep removed telemetry entirely and errors on it.
+    cmd = [tools["opengrep"], "scan", "--config", str(RULES),
+           "--taint-intrafile", "--quiet", "--json", "--output", str(out)]
     if diff_ref:
         cmd += ["--baseline-commit", diff_ref]
     cmd.append(str(root))
@@ -391,8 +524,8 @@ def main():
     ap.add_argument("path", nargs="?", default=".", help="directory to scan")
     ap.add_argument("--diff", nargs="?", const="origin/main", metavar="REF",
                     help="only what changed since REF (default origin/main). "
-                         "Applies to secrets and SAST; deps and IaC are "
-                         "whole-tree either way.")
+                         "Applies to secrets, SAST and IaC; deps is whole-tree "
+                         "either way.")
     ap.add_argument("--history", action="store_true",
                     help="secrets: scan all git history, not the working tree")
     ap.add_argument("--only", action="append", choices=LAYERS, default=[],
@@ -423,6 +556,17 @@ def main():
             tools[binname] = p
         else:
             missing[binname] = VERSIONS[binname]
+    # An absent ruleset is the fail-open this whole file exists to prevent:
+    # opengrep with no rules exits 0 and prints nothing, which reads as clean.
+    if "sast" in layers and not RULES.is_file():
+        sys.stderr.write(
+            f"error: SAST ruleset not found at {RULES}\n"
+            "opengrep has no rules registry, so there is no remote fallback — "
+            "without this file the sast layer would scan clean and mean\n"
+            "nothing. Restore it from ops/forgejo-ci/files/sast-rules.yml, or "
+            "narrow the run with --only.\n")
+        return 2
+
     if missing:
         sys.stderr.write("missing scanner(s):\n")
         for n, v in missing.items():
@@ -454,7 +598,7 @@ def main():
             findings += f
             notes["deps"] = n
         if "iac" in layers:
-            f, n = scan_iac(tools, root, out)
+            f, n = scan_iac(tools, root, out, diff_ref)
             findings += f
             notes["iac"] = n
         if "sast" in layers:
