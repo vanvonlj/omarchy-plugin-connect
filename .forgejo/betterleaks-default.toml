@@ -1,0 +1,87 @@
+# Default betterleaks config for every repo scan.py runs in (SCAN-87).
+# MANAGED FILE — synced by ops/forgejo-ci/rollout.py beside scan.py as
+# .forgejo/betterleaks-default.toml. Edit it in homelab-platform, not here.
+#
+# How scan.py uses it (see secrets_config() in scan.py):
+#   - repo has no .betterleaks.toml   -> `--config` this file;
+#   - repo has one                    -> a temp copy of the repo's file with
+#     its `useDefault = true` swapped for `[extend] path` to this file, so the
+#     repo's own rules and allowlists apply on top of these, and this file's
+#     own `useDefault = true` brings in betterleaks' built-ins;
+#   - this file, or the repo's extend target, missing or unparseable
+#     -> the secrets layer FAILS. betterleaks exits 1 with no output, which
+#     scan.py used to read as "no findings".
+#
+# The rules and allowlists below are scan-console's SCAN-75 .betterleaks.toml,
+# verbatim. Every allowlist is on the secret's VALUE, never on a path:
+# scan-console ships the same rules to tenant scans, where the tenant chooses
+# the paths. To accept a documented example in one repo, add a value or line
+# allowlist to that repo's own .betterleaks.toml — never widen this one.
+#
+# The defaults (betterleaks 1.1.2) do not flag a password in a connection
+# string at all — the 2026-09-25 dependency audit had to grep for them.
+
+[extend]
+useDefault = true
+
+# .NET/ADO, Npgsql, SqlClient and SQL Server JDBC (semicolon-separated)
+# strings; standard JDBC's ?user=…&password=… is not covered. The leading
+# ";" is what makes it a connection string and not any `password=` in prose
+# or a CLI flag; a string that STARTS with Password= is not caught.
+#   - No space on either side of "=": code writes `x; password = input;` on
+#     one line, connection strings write Password=… . So `Password = x` inside
+#     a real connection string is missed, a trade against every
+#     `;`-terminated language reading 'failed'. Spaces and tabs (never \s,
+#     which spans newlines) are allowed only before the key.
+#   - An opening quote is skipped, so a quoted value (valid Npgsql/SqlClient
+#     syntax) is caught too.
+#   - The value stops at a backslash in both rules: in source,
+#     `Password=REPLACE_ME\"` is an escaped quote, and capturing the `\` would
+#     dodge the allowlist.
+#
+# Allowlists are PER RULE, so the defaults behave exactly as without this
+# file. Each matches the whole captured password only:
+#   REPLACE_ME…  the committed appsettings.json placeholders
+#   CHANGEME     the k8s-secrets convention for committed Secret templates
+#   password, your_password   README and docker-compose examples
+# and template references that the defaults' own global allowlist does not
+# already drop (it covers ${VAR}, $VAR, {0}, %s, {{x}}, xxx and ***): $(VAR),
+# {name}, a spaced Helm/Go template (captured as exactly "{{", since the
+# value stops at a space) and <name>. {name} is a trade-off: a real password
+# written as {Word} is dropped too. A console scan with any finding is
+# 'failed', so these would be CRITICAL noise on clean repos.
+# NOT allowlisted, deliberately: postgres, secret, admin and the like. In a
+# committed connection string those are usually the real (weak) credential,
+# which is worth a finding.
+[[rules]]
+id = "connection-string-password"
+description = "Password in a connection string"
+regex = '''(?i);[ \t]*(?:password|pwd)=["']?([^;"'`\s\\]+)'''
+secretGroup = 1
+keywords = ["password", "pwd"]
+
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = [
+    '''(?i)^(?:replace[a-z0-9_]*|changeme|password|your_?password)$''',
+    '''^(?:\$\([^)]*\)|\{[A-Za-z_][A-Za-z0-9_.]*\}|\{\{|<[^>]*>)$''',
+]
+
+# scheme://user:password@host for the database and broker schemes. Not
+# https://, which the default rules already cover per vendor. The user may be
+# empty, which is Redis's own form (a bare ":" then the password).
+# Same allowlist, less "{{" (a URI password ends at "@", never at a space),
+# plus `pass` for `postgresql://user:pass@host/db` in scan.py's own docs.
+[[rules]]
+id = "connection-uri-password"
+description = "Password in a database connection URI"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|sqlserver|mssql)://[^:/@\s"'`]*:([^@/\s"'`\\]+)@'''
+secretGroup = 1
+keywords = ["://"]
+
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = [
+    '''(?i)^(?:replace[a-z0-9_]*|changeme|pass|password|your_?password)$''',
+    '''^(?:\$\([^)]*\)|\{[A-Za-z_][A-Za-z0-9_.]*\}|<[^>]*>)$''',
+]

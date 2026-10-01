@@ -41,6 +41,24 @@ betterleaks with a stale binary all exit 0 and print nothing. The canary scans
 deliberately-bad code first and fails if any tool calls it clean, which is the
 only thing separating "nothing found" from "nothing ran".
 
+## Reporting to scan-console (optional)
+
+With `SCAN_CONSOLE_URL` and `SCAN_CONSOLE_TOKEN` both set, a **whole-tree** run
+is also sent to scan-console, which tracks each finding across runs (new,
+reopened, resolved). It happens after the verdict and cannot change it: console
+down, slow or erroring is one `warning: scan-console:` line on stderr, and the
+report and exit code are exactly what they would have been without it.
+
+- The token is read from the environment only — never pass it as a flag.
+- The target is `--target`, else `SCAN_CONSOLE_TARGET`, else the `origin`
+  remote as `host/owner/repo` (credentials in the remote URL are stripped).
+- `--diff` and `--history` runs are **not** reported: the console would read a
+  partial scan as "everything else was fixed". `--no-report` turns it off.
+- Plain `http://` is refused except to localhost. No matched secret text is
+  sent — betterleaks runs with `--redact` and only rule, title and location go.
+
+CI sets neither variable, so CI does not report.
+
 ## What it does NOT catch
 
 Do not present a clean scan as proof the code is safe.
@@ -73,10 +91,18 @@ scanned, so pasting the sample just relocates the finding.
 
 Two things worth knowing about the secrets layer specifically: `.rafterignore`
 is **not read by anything** any more, so a repo still relying on one has no
-allowlist at all; and the default rules do **not** match
-`postgresql://user:pass@host/db`, which is why `.betterleaks.toml` here carries
-a `database-dsn-credentials` rule — that gap once hid four real leaks where only
-the Kubernetes `stringData` copies of the same password were reported.
+allowlist at all; and betterleaks' own rules do **not** match a password in a
+connection string (`Server=db;Password=<password>` or `postgresql://user:pass@host/db`) —
+that gap once hid four real leaks where only the Kubernetes `stringData` copies
+of the same password were reported. So every run adds the two rules in
+`.forgejo/betterleaks-default.toml`. With no `.betterleaks.toml` that file is
+the config. With one, scan.py swaps your `useDefault = true` for
+`path = <that file>` (or adds that `[extend]` if it has none), so your rules
+and allowlists still apply on top. If your file already uses `[extend] path`,
+point it at `.forgejo/betterleaks-default.toml` — any other path, or
+`useDefault = false`, fails the secrets layer, as does a missing or
+unparseable config. To accept a documented example such as a README's sample password,
+allowlist it in your own `.betterleaks.toml`, never in the managed default.
 
 ## When CI runs it
 
