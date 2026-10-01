@@ -57,7 +57,9 @@ report and exit code are exactly what they would have been without it.
 - Plain `http://` is refused except to localhost. No matched secret text is
   sent — betterleaks runs with `--redact` and only rule, title and location go.
 
-CI sets neither variable, so CI does not report.
+In CI only the weekly default-branch run reports, and only once the org has
+variable `SCAN_CONSOLE_URL` and secret `SCAN_CONSOLE_TOKEN`. Pull-request runs
+never report and never see the token.
 
 ## What it does NOT catch
 

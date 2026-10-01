@@ -50,6 +50,15 @@ jobs:
     # Needs python3 for scan.py itself; opengrep is a static binary.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # 'true' only for the weekly run: a dispatch of the default branch, which
+      # is what rke2/forgejo/15-code-scan-cronjob.yaml fires, with the org
+      # variable set. A PR never reports — its branch reported to the same
+      # target would mark findings fixed that still exist on the default
+      # branch. A missing default_branch makes this false, not true. No secret
+      # here: the token goes only into the env of the one step gated on this.
+      # Delete the org variable SCAN_CONSOLE_URL to turn reporting off.
+      REPORT_TO_CONSOLE: ${{ github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.SCAN_CONSOLE_URL != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,4 +105,23 @@ jobs:
         # dependency CVE fails, IaC and SAST report. Their first-run backlogs
         # run to hundreds and a permanently red check is worth as much as no
         # check. Tighten per repo with --fail-on once a backlog is triaged.
+        if: env.REPORT_TO_CONSOLE != 'true'
+        run: python3 .forgejo/scan.py --format markdown .
+
+      - name: Scan and report to scan-console
+        # The same command as "Scan" above — exactly one of the two runs. With
+        # both values set, scan.py POSTs the whole-tree result after printing
+        # its verdict, best-effort: the report and exit code do not change, and
+        # a console that is down costs one warning line on stderr. This is how
+        # a new advisory against untouched code becomes a new finding there.
+        #
+        # The target is pinned, not derived from the checkout's `origin`: that
+        # remote is whatever URL the runner was given, and a different host
+        # would file every repo under a second target from the one a laptop
+        # `scan` reports to, so nothing would ever resolve or reopen.
+        if: env.REPORT_TO_CONSOLE == 'true'
+        env:
+          SCAN_CONSOLE_URL: ${{ vars.SCAN_CONSOLE_URL }}
+          SCAN_CONSOLE_TOKEN: ${{ secrets.SCAN_CONSOLE_TOKEN }}
+          SCAN_CONSOLE_TARGET: git.lukejv.com/${{ github.repository }}
         run: python3 .forgejo/scan.py --format markdown .
