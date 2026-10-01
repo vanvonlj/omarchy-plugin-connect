@@ -92,10 +92,16 @@ scanned, so pasting the sample just relocates the finding.
 Two things worth knowing about the secrets layer specifically: `.rafterignore`
 is **not read by anything** any more, so a repo still relying on one has no
 allowlist at all; and betterleaks' own rules do **not** match a password in a
-connection string (`Server=db;Password=<password>` or `postgresql://user:pass@host/db`) —
+connection string (`Server=db.internal;Password=<password>` or `postgresql://user:pass@host/db`) —
 that gap once hid four real leaks where only the Kubernetes `stringData` copies
 of the same password were reported. So every run adds the two rules in
-`.forgejo/betterleaks-default.toml`. With no `.betterleaks.toml` that file is
+`.forgejo/betterleaks-default.toml`. They deliberately skip a password whose
+host is loopback (`localhost`, `127.0.0.1`, `::1`) or, in key=value strings
+only (`Host=`, `Server=`, `Data Source=`…; never URIs), a listed compose/CI
+container name (only `db` and `postgres`; a k8s Service literally named one
+of those would be missed), plus
+`__NAME__` render markers — so a clean scan on a password to `Host=postgres` is
+an exemption, not a miss; the toml lists exactly what is skipped. With no `.betterleaks.toml` that file is
 the config. With one, scan.py swaps your `useDefault = true` for
 `path = <that file>` (or adds that `[extend]` if it has none), so your rules
 and allowlists still apply on top. If your file already uses `[extend] path`,
