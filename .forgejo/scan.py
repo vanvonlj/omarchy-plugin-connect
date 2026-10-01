@@ -112,14 +112,18 @@ class LayerError(Exception):
 
 
 class Finding:
-    __slots__ = ("layer", "severity", "ident", "title", "location")
+    __slots__ = ("layer", "severity", "ident", "title", "location", "remediation")
 
-    def __init__(self, layer, severity, ident, title, location):
+    def __init__(self, layer, severity, ident, title, location, remediation=None):
         self.layer = layer
         self.severity = severity if severity in SEVERITY_ORDER else "INFO"
         self.ident = ident
         self.title = title
         self.location = location
+        # What to do about it, for scan-console only. Never part of the title:
+        # fingerprint() hashes the title, so guidance there would change the
+        # identity of every finding the day the guidance changed.
+        self.remediation = remediation
 
 
 def find_tool(name):
@@ -385,6 +389,49 @@ def scan_secrets(tools, root, diff_ref, history, tmp):
     return findings, None
 
 
+def version_key(v):
+    """Sort key for a package version, numeric-aware: 1.0.9 < 1.0.10.
+
+    A letter run sorts below the end of the version, which sorts below a
+    number, so 1.0.0-rc.1 < 1.0.0 < 1.0.1."""
+    # ponytail: one ordering for every ecosystem, not each one's own rules
+    # (PEP 440 post-releases and epochs, Debian `~` sort wrong). Upgrade path:
+    # per-ecosystem comparators if a hint is ever seen naming a wrong version.
+    return [(2, int(t)) if t.isdigit() else (0, t)
+            for t in re.findall(r"\d+|[A-Za-z]+", str(v or ""))] + [(1, "")]
+
+
+def fixed_version(pkg, ids, vulns):
+    """The version of `pkg` that fixes every advisory in `ids` that has a
+    published fix, above the installed one; None if none has one.
+
+    Per advisory, its lowest `fixed` above the installed version: an
+    advisory with backport branches fixes 1.2.5 AND 2.0.3, and a 2.0.0
+    install is not fixed by downgrading. Across the group, the highest of
+    those: the ids are usually aliases of one vulnerability, but when they
+    are distinct advisories the lowest would leave the others open. An id
+    with no fix is passed over — an alias often lacks the range data its
+    twin has, and "no fix published" would then be wrong for the group.
+
+    This package only — an advisory lists siblings too (lodash's names
+    lodash-es), and their fix versions mean nothing here. GIT ranges are
+    skipped: their events are commit hashes, not versions."""
+    name, have = pkg.get("name"), version_key(pkg.get("version"))
+    best = []
+    for v in vulns:
+        if v.get("id") not in ids:
+            continue
+        fixes = [e["fixed"]
+                 for a in lst(v, "affected")
+                 if (a.get("package") or {}).get("name") == name
+                 for r in lst(a, "ranges") if r.get("type") != "GIT"
+                 for e in lst(r, "events")
+                 if e.get("fixed") and version_key(e["fixed"]) > have]
+        if fixes:
+            best.append(min(fixes, key=version_key))
+    return max(best, key=version_key) if best else None
+
+
 def scan_deps(tools, root, out):
     """Dependency CVEs.
 
@@ -416,10 +463,13 @@ def scan_deps(tools, root, out):
                        else "MEDIUM" if score >= 4 else "LOW")
                 ids = g.get("ids") or ["?"]
                 rel = os.path.relpath(src, str(root)) if src else "?"
+                fix = fixed_version(info, ids, lst(p, "vulnerabilities"))
                 findings.append(Finding(
                     "deps", sev, ids[0],
                     f"{info.get('name','?')} {info.get('version','')} "
-                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}", rel))
+                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}", rel,
+                    f"Upgrade {info.get('name','?')} to {fix} or later" if fix
+                    else "No fixed version published"))
     note = None
     if not sources:
         note = ("no lockfile found, so NOTHING was checked for dependency "
@@ -575,12 +625,16 @@ def scan_sast(tools, root, out, diff_ref):
     findings = []
     for x in lst(load_json(out), "results"):
         extra = x.get("extra") or {}
+        message = (extra.get("message") or "").strip()
         findings.append(Finding(
             "sast", SEMGREP_SEV.get(extra.get("severity"), "LOW"),
             (x.get("check_id") or "?").split(".")[-1],
-            (extra.get("message") or "").strip().split("\n")[0][:100],
+            message.split("\n")[0][:100],
             f"{rel(x.get('path'), root)}:"
-            f"{(x.get('start') or {}).get('line')}"))
+            f"{(x.get('start') or {}).get('line')}",
+            # The rule's whole message: the title is only its first line, and
+            # the how-to-fix is usually below it. Redacted in build_payload().
+            message or None))
     return findings, None
 
 
@@ -639,6 +693,7 @@ def report(findings, notes, layers, fmt, diff_ref, limit=20):
 
 REPORT_TIMEOUT = 5.0       # seconds, for the whole request — not per socket op
 REPORT_TITLE_MAX = 200
+REMEDIATION_MAX = 2000     # a rule message is a paragraph, not a document
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # The shapes the console refuses as unredacted (api/Validation/Validate.cs).
@@ -763,6 +818,10 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried):
             "title": redact(f.title)[:REPORT_TITLE_MAX] or f.ident or "?",
             "ruleId": f.ident,
             "location": redact(f.location),
+            # redact() before the cap, so a cut can never leave half a key
+            # unrecognisable to it.
+            "remediation": (redact(f.remediation)[:REMEDIATION_MAX]
+                            if f.remediation else None),
         })
     return {
         "target": target,
