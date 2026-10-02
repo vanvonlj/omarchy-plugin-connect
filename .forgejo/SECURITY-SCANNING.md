@@ -18,6 +18,10 @@ scan --only secrets  # one layer: secrets | deps | iac | sast
 scan --history       # secrets across all git history
 ```
 
+A git worktree parked under a gitignored `.worktrees/` is covered too: osv-scanner
+honours ancestor `.gitignore` files, so `scan_deps()` retries with `--no-ignore`
+when the first pass finds no lockfile.
+
 If `scan` is not on PATH, `python3 .forgejo/scan.py --diff` is identical — the
 wrapper only locates this file.
 
@@ -32,7 +36,8 @@ pre-existing findings; a diff has no backlog, so everything in it is yours.
 |---|---|
 | `FAILED` | act before committing |
 | `PASSED` | the gate passed — **not** "no findings"; IaC and SAST report without blocking on a whole-tree run |
-| `PASSED — but deps was not actually covered` | no lockfile found, so nothing was checked. **Uncovered, not clean.** |
+| `FAILED: deps covered nothing` | `--diff` only: no lockfile found anywhere, so nothing was checked. **Uncovered, not clean.** Pass `--allow-uncovered` if this repo genuinely has no lockfile. |
+| `PASSED — but deps was not actually covered` | the same hole, on a whole-tree run or accepted with `--allow-uncovered` |
 | `CANARY FAILED` | the scan is broken, not clean. Never read it as a pass. |
 
 That last row is the important one. Every tool here **fails open**: opengrep with

@@ -22,7 +22,9 @@ stderr and nothing else: stdout's report and the exit code are exactly what
 they would have been with reporting off. The token is read from the
 environment only, never a flag (shell history, `ps`). The target defaults to
 SCAN_CONSOLE_TARGET, else the `origin` remote as host/owner/repo. --diff and
---history runs are never reported — see report_to_console(). Neither variable
+--history runs are never reported — see report_to_console(). The report names
+the commit and branch (GITHUB_SHA/GITHUB_REF_NAME, else git), and stdout ends
+with a link to the scan in the console. Neither variable
 set, which is how CI runs, means no reporting and no output about it.
 
 WHY THIS IS ONE FILE AND NOT FOUR WORKFLOW STEPS. A local run has to predict the
@@ -432,20 +434,16 @@ def fixed_version(pkg, ids, vulns):
     return max(best, key=version_key) if best else None
 
 
-def scan_deps(tools, root, out):
-    """Dependency CVEs.
-
-    Reports UNCOVERED rather than clean when no lockfile was found. "Nothing to
-    scan" and "nothing wrong" are different answers, and osv-scanner's own
-    --allow-no-lockfiles collapses them into a cheerful exit 0.
+def osv_source_scan(tools, root, out, extra=()):
+    """One osv-scanner pass over root. Returns (findings, set of lockfile paths).
 
     --all-packages is load-bearing: without it osv-scanner emits a `results`
     entry only for a source that HAS a vulnerability, so a clean lockfile is
     indistinguishable from no lockfile and every clean run reads UNCOVERED.
     """
     run([tools["osv-scanner"], "scan", "source", "-r", "--allow-no-lockfiles",
-         "--all-packages", "--format", "json", "--output-file", str(out),
-         str(root)])
+         "--all-packages", *extra, "--format", "json", "--output-file",
+         str(out), str(root)])
     doc = load_json(out)
     findings, sources = [], set()
     for r in lst(doc, "results"):
@@ -462,14 +460,51 @@ def scan_deps(tools, root, out):
                 sev = ("CRITICAL" if score >= 9 else "HIGH" if score >= 7
                        else "MEDIUM" if score >= 4 else "LOW")
                 ids = g.get("ids") or ["?"]
-                rel = os.path.relpath(src, str(root)) if src else "?"
                 fix = fixed_version(info, ids, lst(p, "vulnerabilities"))
                 findings.append(Finding(
                     "deps", sev, ids[0],
                     f"{info.get('name','?')} {info.get('version','')} "
-                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}", rel,
+                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}",
+                    rel(src, root),
                     f"Upgrade {info.get('name','?')} to {fix} or later" if fix
                     else "No fixed version published"))
+    return findings, sources
+
+
+def scan_deps(tools, root, out):
+    """Dependency CVEs.
+
+    Reports UNCOVERED rather than clean when no lockfile was found. "Nothing to
+    scan" and "nothing wrong" are different answers, and osv-scanner's own
+    --allow-no-lockfiles collapses them into a cheerful exit 0.
+
+    THE --no-ignore RETRY (CNVYR-156, SCAN-111). osv-scanner honours .gitignore,
+    and it honours it from directories ABOVE the scan root as well. So scanning
+    a path that some ancestor repository ignores walks exactly one directory,
+    finds no lockfile, and reports UNCOVERED with a package-lock.json in plain
+    sight. The case that matters: a git worktree under a gitignored
+    `.worktrees/`, which is where every agent works, so this is the DEFAULT
+    path and not an edge case. It is not about the worktree `.git` being a
+    file — a worktree outside the ignored directory scans fine.
+
+    The retry only fires when the first pass found NOTHING, because
+    --no-ignore is otherwise actively wrong: in a normal checkout it walks
+    node_modules and every sibling worktree, and reports the same advisory once
+    per copy. A repo with no lockfile of its own also takes the retry, so its
+    result is filtered through root's OWN .gitignore: a sibling worktree's
+    lockfile under .worktrees/ is not this tree's coverage. Only an ancestor's
+    ignore is the bug, and from inside a real worktree that one does not apply.
+    """
+    findings, sources = osv_source_scan(tools, root, out)
+    if not sources:
+        findings, sources = osv_source_scan(tools, root, out, ["--no-ignore"])
+        rc, so, _ = run(["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+                        input="\0".join(sorted(sources)))
+        if rc == 0:   # 1 = none ignored; 128 = not a repo, nothing to filter by
+            ignored = set(so.split("\0")) - {""}
+            sources -= ignored
+            findings = [f for f in findings
+                        if f.location not in {rel(i, root) for i in ignored}]
     note = None
     if not sources:
         note = ("no lockfile found, so NOTHING was checked for dependency "
@@ -796,7 +831,27 @@ def resolve_target(explicit, root):
     return normalise_remote(so) if rc == 0 else None
 
 
-def build_payload(target, started_at, rc, layers, findings, notes, canaried):
+def git_head(root):
+    """{"commit", "ref"} for the console, each key left out — never "" — when
+    unknown: a detached HEAD has no branch, a tarball no commit. CI's own
+    GITHUB_SHA / GITHUB_REF_NAME win, because a CI checkout is often detached.
+    Exec form, never a shell; the ref goes as read and the console validates
+    it. git failing or missing just drops the key — run() never raises."""
+    head = {}
+    for key, var, cmd in (
+            ("commit", "GITHUB_SHA", ["rev-parse", "--verify", "-q", "HEAD"]),
+            ("ref", "GITHUB_REF_NAME", ["symbolic-ref", "--short", "-q", "HEAD"])):
+        v = (os.environ.get(var) or "").strip()
+        if not v:
+            rc, so, _ = run(["git", "-C", str(root)] + cmd)
+            v = so.strip() if rc == 0 else ""
+        if v:
+            head[key] = v
+    return head
+
+
+def build_payload(target, started_at, rc, layers, findings, notes, canaried,
+                  head=None):
     """The console's ReportScanRequest, and nothing else: it rejects unknown
     fields (JsonUnmappedMemberHandling.Disallow), so an extra key is a 400.
 
@@ -830,6 +885,7 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried):
         "layers": {l: bool(canaried and not notes.get(l)) for l in layers},
         "toolVersions": {NEEDS[l]: VERSIONS[NEEDS[l]] for l in layers},
         "findings": out,
+        **(head or {}),
     }
 
 
@@ -943,7 +999,7 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
                  "(no usable `origin` remote to derive it from). Not reported")
             return
         payload = build_payload(target, started_at, rc, layers, findings,
-                                notes, canaried)
+                                notes, canaried, git_head(root))
         _, doc = post_report(base.rstrip("/") + "/scans/reported", token,
                              payload, REPORT_TIMEOUT)
     except Exception as e:
@@ -954,9 +1010,15 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
         return
     try:
         sid = doc.get("id", "?")
+        # SCAN-102's route, last on stdout so a CI log ends on it. Built from
+        # the URL only; the token is never in it.
+        link = (f"{base.rstrip('/')}/#/scans/{sid}"
+                if isinstance(sid, int) and not isinstance(sid, bool) else None)
         new, reopened = doc.get("new"), doc.get("reopened")
         if not isinstance(new, list) or not isinstance(reopened, list):
             print(f"console: scan {sid} recorded")
+            if link:
+                print(f"console: {link}")
             return
         print(f"console: scan {sid} recorded — {len(new)} new, "
               f"{len(reopened)} reopened, {doc.get('resolved', 0)} resolved")
@@ -974,6 +1036,8 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
             print(f"                    {f.ident} — {f.title}")
         if len(rows) > limit:
             print(f"  … {len(rows) - limit} more")
+        if link:
+            print(f"console: {link}")
     except Exception as e:
         warn(f"recorded, but the response was unreadable ({_why(e)})")
 
@@ -999,6 +1063,10 @@ def main():
                          "(default 9.0; above 10 disables)")
     ap.add_argument("--fail-on", action="append", choices=LAYERS, default=[],
                     metavar="LAYER", help="also fail on any finding in LAYER")
+    ap.add_argument("--allow-uncovered", action="store_true",
+                    help="in --diff mode, do not fail when a layer covered "
+                         "nothing at all (a repo with no lockfile anywhere). "
+                         "The hole is still printed; you are accepting it.")
     ap.add_argument("--no-fail-new", action="store_true",
                     help="in --diff mode, report newly introduced HIGH/CRITICAL "
                          "findings instead of failing on them")
@@ -1116,13 +1184,21 @@ def main():
         n = sum(1 for f in findings if f.layer == layer)
         if n:
             reasons.append(f"{n} {layer} finding(s) (--fail-on {layer})")
+    # A gate that could not check something must not report success, and the
+    # one word an automated caller reads is PASSED: it opens the PR having
+    # checked nothing (CNVYR-156). --diff only, because whole-tree is CI, and
+    # half the org has no lockfile at all — failing there turns those repos red
+    # for a hole nobody can fix. --allow-uncovered accepts it on purpose.
+    uncovered = [k for k, v in notes.items() if v and k not in broken]
+    if diff_ref and uncovered and not args.allow_uncovered:
+        reasons.append(f"{', '.join(uncovered)} covered nothing — uncovered, "
+                       "not clean (--allow-uncovered to accept)")
 
     print()
     if reasons:
         print("FAILED: " + "; ".join(reasons) + ".")
         rc = 1
     else:
-        uncovered = [k for k, v in notes.items() if v]
         if uncovered:
             print(f"PASSED — but {', '.join(uncovered)} was not actually "
                   "covered, see the note above.")
