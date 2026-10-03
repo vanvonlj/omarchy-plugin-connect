@@ -134,7 +134,7 @@ touches. Stopping after the two or three most obvious problems is the failure
 mode here: it drips one issue per push and the author pays for another round
 trip to learn the rest, so a partial review is worse than a slow one.
 
-READ AROUND THE DIFF. You have Read, Grep and Glob over the checkout and a hunk
+READ AROUND THE DIFF. You have Read, Grep and Glob over the checkout, and a hunk
 in isolation is not enough to judge one. Before reporting — or clearing — a
 change, look at what it depends on: the callers of a function whose contract
 moved, the other implementations of an interface, the tests that cover it, the

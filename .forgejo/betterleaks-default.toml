@@ -24,11 +24,18 @@
 # It was not mirrored to scan-console's .betterleaks.toml; if that copy is
 # ever synced from this one, drop the names there and keep loopback only.
 #
-# The defaults (betterleaks 1.1.2) do not flag a password in a connection
-# string at all — the 2026-09-25 dependency audit had to grep for them.
+# betterleaks 1.1.2's defaults flagged no password in a connection string at
+# all — the 2026-09-25 dependency audit had to grep for them. 1.8.0 added
+# generic-password and generic-credential-uri, which flag some (and the
+# placeholders these rules allowlist). They are disabled below (SCAN-127):
+# that keeps the gate's coverage what it was on 1.1.2, where these rules do
+# the job with placeholder allowlists. test_secrets_config.py section 4a
+# fails on betterleaks 1.8+ if they come back on, with or without a repo
+# .betterleaks.toml in the chain.
 
 [extend]
 useDefault = true
+disabledRules = ["generic-password", "generic-credential-uri"]
 
 # .NET/ADO, Npgsql, SqlClient and SQL Server JDBC (semicolon-separated)
 # strings; standard JDBC's ?user=…&password=… is not covered. The leading
