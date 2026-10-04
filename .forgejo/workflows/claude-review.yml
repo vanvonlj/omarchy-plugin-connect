@@ -13,6 +13,8 @@ name: Claude PR review
 # Reviews the diff of every pull request and posts INLINE review comments —
 # anchored to file and line, so each one is a thread Forgejo can resolve — plus
 # a summary. Findings already raised on an earlier push are not repeated.
+# Each finding gets an id (F1, F2, ...) and the run ends by setting a
+# `review-findings` commit status: green at 0 open. See the README.
 #
 # THE REVIEW LOGIC IS NOT IN THIS FILE. It is `.forgejo/review.py`, synced here
 # by `rollout.py`, same arrangement as scan.py: logic in a workflow file cannot

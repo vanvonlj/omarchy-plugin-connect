@@ -24,6 +24,14 @@ most of the same things. So instead:
   * each comment carries a fingerprint of (path, title). On the next push,
     anything already raised is skipped — including the ones you resolved. That
     is the whole point of resolving something.
+  * each finding gets a PR-wide id (F1, F2, … continuing across pushes) and a
+    `review-findings` commit status on the head: green at 0 open, red with the
+    open ids otherwise. A finding closes when a reply carries a resolve marker
+    (`<!-- claude-review-resolve:F2 declined: <reason> -->`, written by the
+    agent-side script in lukejv-dev/assistant, scripts/review-findings.ts) or
+    when someone clicks Resolve in the UI. Forgejo 16 has NO API to resolve a
+    conversation (the comment's `resolver` is read-only, the web route needs a
+    session and CSRF token), so the marker is the record and Resolve is optional.
 
 NOT SUPPORTED HERE: Forgejo 16 renders a ```suggestion block as an ordinary code
 block. There is no apply button (that is a GitHub feature Forgejo has not
@@ -55,6 +63,24 @@ MAX_INLINE = 25
 
 SEVERITY = {"high": "🔴 **High**", "medium": "🟠 **Medium**", "low": "🔵 **Low**"}
 
+# The two markers the tracking runs on. A finding: fingerprint plus PR-wide id
+# (findings posted before ids existed have none, and are known as c<comment id>).
+# A resolution: posted by whoever dealt with it, in a reply or a PR comment.
+FINDING = re.compile(r"<!-- claude-review:([0-9a-f]+)(?: (F\d+))? -->")
+RESOLVE = re.compile(r"<!-- claude-review-resolve:(F\d+|c\d+) (fixed|declined)(?:: (.*?))? -->")
+# One per review run, in its summary (or fallback comment): how many findings
+# never became threads, and whether the diff was cut short. The latest run's
+# marker keeps the status red until a run with no gaps, whatever the threads say.
+RUN = re.compile(r"<!-- claude-review-run:(fallback|\d+ [01]) -->")
+STATUS_CONTEXT = "review-findings"
+
+
+def defuse(text):
+    """Model-written text with the marker name broken by a zero-width space: it
+    reads the same, even inside code, but can no longer fake an id, a
+    resolution or a run."""
+    return text.replace("claude-review", "claude\u200b-review")
+
 
 def sh(*args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw).stdout
@@ -79,6 +105,48 @@ def api(method, path, payload=None):
     return None
 
 
+def get_all(path):
+    """GET a list, every page. Raises instead of returning a partial list: the
+    findings status is a merge signal, and a failed read must never turn into
+    "0 open"."""
+    out, page = [], 1
+    while True:
+        sep = "&" if "?" in path else "?"
+        batch = api("GET", f"{path}{sep}limit=50&page={page}")
+        if batch is None:
+            raise RuntimeError(f"GET {path} failed")
+        out += batch
+        if len(batch) < 50:
+            return out
+        page += 1
+
+
+def review_comments(repo, pr, reviews=None):
+    """Every inline review comment on the PR, oldest first."""
+    out = []
+    for review in reviews if reviews is not None else get_all(f"/repos/{repo}/pulls/{pr}/reviews"):
+        out += get_all(f"/repos/{repo}/pulls/{pr}/reviews/{review['id']}/comments")
+    return sorted(out, key=lambda c: c["id"])
+
+
+def gaps(reviews, issue_comments):
+    """What the latest review run could not track, as status text, or "".
+    Reviews and comments are two id sequences, so newest is by timestamp."""
+    runs = [(r.get("submitted_at") or "", r.get("body") or "") for r in reviews]
+    runs += [(c.get("created_at") or "", c.get("body") or "") for c in issue_comments]
+    for _, body in sorted(runs, key=lambda r: r[0], reverse=True):
+        m = RUN.search(body)
+        if not m:
+            continue
+        if m.group(1) == "fallback":
+            return "latest review fell back to a plain comment, read it"
+        untracked, truncated = m.group(1).split()
+        return "; ".join(t for t in (
+            f"{untracked} finding(s) only in the summary" if untracked != "0" else "",
+            "diff truncated, partly reviewed" if truncated == "1" else "") if t)
+    return ""
+
+
 def collect_diff(base_sha, head_sha):
     """(diff text, was it truncated). Merge-base, so unrelated base commits
     landed since the branch forked are not attributed to this PR."""
@@ -97,7 +165,7 @@ def anchors(diff):
 
     A review comment only renders if its line is inside a hunk. Posting one
     outside gets silently swallowed by the API, so findings that do not land
-    here are demoted to the summary rather than vanishing.
+    here are moved onto one that does by place(), rather than vanishing.
     """
     out, path, line = {}, None, 0
     for raw in diff.splitlines():
@@ -236,25 +304,138 @@ def fingerprint(f):
     return hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
-def already_raised(repo, pr):
-    """Fingerprints of every finding this reviewer has posted before —
-    resolved or not. Resolved means dealt with; unresolved means it is already
+def already_raised(comments):
+    """(fingerprints of every finding posted before, highest F number used).
+    Resolved or not: resolved means dealt with, unresolved means it is already
     on screen. Neither wants saying twice."""
-    seen = set()
-    for review in api("GET", f"/repos/{repo}/pulls/{pr}/reviews") or []:
-        for c in api("GET", f"/repos/{repo}/pulls/{pr}/reviews/{review['id']}/comments") or []:
-            seen.update(re.findall(r"<!-- claude-review:([0-9a-f]+) -->", c.get("body", "")))
-    return seen
+    seen, top = set(), 0
+    for c in comments:
+        for fp, fid in FINDING.findall(c.get("body", "")):
+            seen.add(fp)
+            if fid:
+                top = max(top, int(fid[1:]))
+    return seen, top
 
 
-def render(f):
+def findings_state(comments, issue_comments):
+    """{id: {title, url, state, reason}} in posting order. state is open,
+    fixed, declined (a resolve marker; the latest wins) or resolved (clicked
+    Resolve in the UI, no marker)."""
+    found, verdicts = {}, {}
+    for c in comments:
+        body = c.get("body", "")
+        m = FINDING.search(body)
+        if m:
+            fid = m.group(2) or f"c{c['id']}"
+            # Two runs racing on one PR can both hand out the same F<n>. Keyed
+            # by id, the second would silently replace the first: one open
+            # finding gone from the count, and one marker closing both.
+            if fid in found:
+                fid = f"c{c['id']}"
+            title = body.split("\n", 1)[0].rsplit(" · ", 1)[-1].strip()
+            found[fid] = {"title": title, "url": c.get("html_url", ""),
+                          "state": "resolved" if c.get("resolver") else "open",
+                          "reason": ""}
+    # Oldest first across both lists (they share one id sequence), so the
+    # latest marker for an id really is the last one applied.
+    for c in sorted(comments + issue_comments, key=lambda c: c["id"]):
+        body = c.get("body", "")
+        # Never from a body carrying a finding: that text is the model's, and a
+        # diff that talks the model into writing a marker would close itself.
+        if not FINDING.search(body):
+            for fid, verdict, reason in RESOLVE.findall(body):
+                verdicts[fid] = (verdict, reason.strip())
+    for fid, (verdict, reason) in verdicts.items():
+        if fid in found:
+            found[fid].update(state=verdict, reason=reason)
+    return found
+
+
+def describe(found, gap=""):
+    """(commit status state, description). Declined reasons are in it so Lucas
+    can skim just those without opening the PR. A gap is always red."""
+    n = {k: [i for i, f in found.items() if f["state"] == k]
+         for k in ("open", "fixed", "declined", "resolved")}
+    counts = " · ".join(f"{len(v)} {k}" for k, v in n.items() if v and k != "open")
+    if n["open"]:
+        desc = f"{len(n['open'])} open: {', '.join(n['open'])}" + (f" · {counts}" if counts else "")
+        state = "failure"
+    else:
+        desc = f"0 open · {counts}" if counts else "0 findings"
+        if n["declined"]:
+            desc += " — " + "; ".join(f"{i} {found[i]['reason'][:60]}" for i in n["declined"])
+        state = "success"
+    if gap:
+        state, desc = "failure", f"{gap} · {desc}"
+    # ponytail: hard cap for the status column; the full list is on the PR.
+    return state, desc if len(desc) <= 255 else desc[:254] + "…"
+
+
+def publish_status(repo, pr, head):
+    """Recompute every finding on the PR and set `review-findings` on head."""
+    try:
+        reviews = get_all(f"/repos/{repo}/pulls/{pr}/reviews")
+        issue_comments = get_all(f"/repos/{repo}/issues/{pr}/comments")
+        found = findings_state(review_comments(repo, pr, reviews), issue_comments)
+        state, desc = describe(found, gaps(reviews, issue_comments))
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        state, desc = "error", "could not read the findings; see the review job log"
+    if not set_status(repo, pr, head, state, desc):
+        return 1
+    print(f"{STATUS_CONTEXT}: {state} — {desc}")
+    return 0
+
+
+def set_status(repo, pr, head, state, desc):
+    """True if the status was set. A failure is loud: a merge signal that did
+    not land must not look like one that did."""
+    server = os.environ["API"].removesuffix("/api/v1")
+    ok = api("POST", f"/repos/{repo}/statuses/{head}", {
+        "state": state, "context": STATUS_CONTEXT, "description": desc,
+        "target_url": f"{server}/{repo}/pulls/{pr}/files"}) is not None
+    if not ok:
+        print(f"{STATUS_CONTEXT} NOT set on {head} (wanted {state}: {desc})", file=sys.stderr)
+    return ok
+
+
+def render(f, fid, note=""):
     sev = SEVERITY.get(f.get("severity", "medium"), SEVERITY["medium"])
-    parts = [f"{sev} · {f['title']}", "", f["body"].strip()]
+    clean = defuse
+    parts = [f"**{fid}** · {sev} · {clean(f['title'])}", ""]
+    if note:
+        parts += [note, ""]
+    parts += [clean(f["body"].strip())]
     if f.get("suggestion"):
         parts += ["", "**Suggested change**", "```suggestion",
-                  f["suggestion"].rstrip(), "```"]
-    parts += ["", f"<!-- claude-review:{fingerprint(f)} -->"]
+                  clean(f["suggestion"].rstrip()), "```"]
+    parts += ["", f"<!-- claude-review:{fingerprint(f)} {fid} -->"]
     return "\n".join(parts)
+
+
+def place(f, valid):
+    """(path, line, extra_lines_count, note) to post a finding at, or None.
+    Out of the hunks it still goes inline — on the file's first changed line,
+    or the diff's — because only an inline comment is a thread that can be
+    tracked and resolved. The note says where it was meant."""
+    if not valid:
+        return None
+    line, end = f.get("line"), f.get("end_line") or f.get("line")
+    path, lines, note = f["path"], valid.get(f["path"], set()), ""
+    if not isinstance(line, int) or line not in lines:
+        note = (f"_Meant `{path}" + (f":{line}" if isinstance(line, int) else "")
+                + "`, outside this diff's hunks._")
+        if not lines:
+            path = next(iter(valid))
+            lines = valid[path]
+        line = end = min(lines)
+    # A multi-line comment whose tail runs past the hunk is rejected whole,
+    # so the span is clipped to what the diff actually shows.
+    extra = 0
+    if isinstance(end, int) and end > line:
+        while extra < end - line and line + extra + 1 in lines:
+            extra += 1
+    return path, line, extra, note
 
 
 def main():
@@ -263,7 +444,7 @@ def main():
     diff, guidance, truncated = collect_diff(os.environ["BASE_SHA"], head)
     if not diff.strip():
         print("empty diff, nothing to review")
-        return 0
+        return publish_status(repo, pr, head)
 
     guidance_block = ""
     if guidance.strip():
@@ -281,10 +462,17 @@ def main():
     if result is None:
         return post_fallback(repo, pr, head,
                              "The review ran but its output could not be parsed. "
-                             "Check the job log.")
+                             "Check the job log.",
+                             "review output unparseable: no findings checked, see the job log")
 
     valid = anchors(diff)
-    seen = already_raised(repo, pr)
+    try:
+        seen, top = already_raised(review_comments(repo, pr))
+    except RuntimeError as e:
+        # Unknown history: posting anyway would re-raise and renumber, so stop.
+        print(e, file=sys.stderr)
+        set_status(repo, pr, head, "error", "could not read earlier findings; see the review job log")
+        return 1
     inline, demoted, repeats = [], [], 0
 
     for f in result.get("findings", []):
@@ -293,19 +481,14 @@ def main():
         if fingerprint(f) in seen:
             repeats += 1
             continue
-        line, end = f.get("line"), f.get("end_line") or f.get("line")
-        lines = valid.get(f["path"], set())
-        if not isinstance(line, int) or line not in lines or len(inline) >= MAX_INLINE:
+        spot = place(f, valid) if len(inline) < MAX_INLINE else None
+        if spot is None:
             demoted.append(f)
             continue
-        # A multi-line comment whose tail runs past the hunk is rejected whole,
-        # so the span is clipped to what the diff actually shows.
-        extra = 0
-        if isinstance(end, int) and end > line:
-            while extra < end - line and line + extra + 1 in lines:
-                extra += 1
-        inline.append({"path": f["path"], "new_position": line,
-                       "extra_lines_count": extra, "body": render(f)})
+        path, line, extra, note = spot
+        top += 1
+        inline.append({"path": path, "new_position": line,
+                       "extra_lines_count": extra, "body": render(f, f"F{top}", note)})
 
     body = summary(result, inline, demoted, repeats, truncated, head)
     posted = api("POST", f"/repos/{repo}/pulls/{pr}/reviews",
@@ -314,7 +497,7 @@ def main():
     if posted:
         print(f"review posted: {len(inline)} inline, {len(demoted)} in summary, "
               f"{repeats} already raised")
-        return 0
+        return publish_status(repo, pr, head)
     # A rejected review (a stale commit_id, a line the API disagrees about)
     # must not swallow the findings — they go up as a plain comment instead.
     return post_fallback(repo, pr, head, body + inline_as_text(inline))
@@ -326,7 +509,9 @@ def summary(result, inline, demoted, repeats, truncated, head):
         out.append("\nNothing to change." if not repeats else
                    f"\nNothing new. {repeats} earlier finding(s) already on this PR.")
     if demoted:
-        out += ["", "**Not attached to a line** (outside this diff's hunks):", ""]
+        out += ["", f"**Not posted inline** (past the {MAX_INLINE}-comment cap, or no "
+                    "changed line to hang them on; untracked until a later push "
+                    "raises them again):", ""]
         out += [f"- `{f['path']}`"
                 + (f":{f['line']}" if isinstance(f.get("line"), int) else "")
                 + f" — {f['title']}: {f['body'].strip()}" for f in demoted]
@@ -351,7 +536,10 @@ def summary(result, inline, demoted, repeats, truncated, head):
                     "is partial.</sub>"]
     out += ["", f"<sub>Automated review of `{head}`. Not a substitute for a "
                 "human look.</sub>"]
-    return "\n".join(out)
+    # Everything above is or quotes model text, so it is defused whole; the
+    # run marker goes on after, as the only real one.
+    return (defuse("\n".join(out))
+            + f"\n\n<!-- claude-review-run:{len(demoted)} {int(truncated)} -->")
 
 
 def inline_as_text(inline):
@@ -361,8 +549,16 @@ def inline_as_text(inline):
         f"**`{c['path']}:{c['new_position']}`**\n\n{c['body']}" for c in inline)
 
 
-def post_fallback(repo, pr, head, body):
+def post_fallback(repo, pr, head, body,
+                  why="review fell back to a plain comment: findings untracked, read it"):
+    # The body's own run marker (if any) says nothing was lost; this one says
+    # everything was. Resolve markers in it are model text, never honoured.
+    body = RUN.sub("", body).replace("claude-review-resolve", "claude\u200b-review-resolve")
+    body += "\n\n<!-- claude-review-run:fallback -->"
     ok = api("POST", f"/repos/{repo}/issues/{pr}/comments", {"body": body})
+    # A plain comment has no threads to resolve, so nothing here can go green.
+    if not set_status(repo, pr, head, "failure", why):
+        return 1
     if not ok:
         print("both the review and the fallback comment failed", file=sys.stderr)
         return 1
