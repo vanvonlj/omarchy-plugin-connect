@@ -995,8 +995,34 @@ def git_head(root):
     return head
 
 
+# The console's note line (api/Validation/Validate.cs NoteLinePattern): no
+# control or bidi characters, 1 to 300 UTF-16 units, at most 500 per layer.
+# One bad line is a 400 for the whole report, so they are made to fit here.
+# Lone surrogates too: a non-UTF-8 file name comes out of git that way, and
+# it cannot be encoded to send.
+_NOTE_BAD = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e"
+                       "\u2066-\u2069\u2028\u2029\ud800-\udfff]")
+NOTE_MAX, NOTE_LINES_MAX = 300, 500
+
+
+def note_lines(gaps):
+    """[(path, reason)] as the console's note lines: `path: reason`.
+
+    A bad character becomes `?`, never nothing, so it cannot join two halves
+    of a key; the cap comes after redact() for the reason remediation's does."""
+    out = []
+    for p, why in gaps:
+        s = redact(_NOTE_BAD.sub("?", f"{p}: {why}"))[:NOTE_MAX]
+        while len(s.encode("utf-16-le")) > 2 * NOTE_MAX:   # astral = 2 units
+            s = s[:-1]
+        out.append(s)
+    if len(out) > NOTE_LINES_MAX:
+        out[NOTE_LINES_MAX - 1:] = [f"… {len(out) - NOTE_LINES_MAX + 1} more"]
+    return out
+
+
 def build_payload(target, started_at, rc, layers, findings, notes, canaried,
-                  head=None):
+                  head=None, partial=None):
     """The console's ReportScanRequest, and nothing else: it rejects unknown
     fields (JsonUnmappedMemberHandling.Disallow), so an extra key is a 400.
 
@@ -1004,7 +1030,15 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried,
     stronger than "redacted". A layer is True only if it ran, had no coverage
     note AND passed the canary — the console resolves every open finding in a
     layer that "ran" and was not reported, so claiming coverage for an
-    uncovered or unverified layer would mark live findings fixed."""
+    uncovered or unverified layer would mark live findings fixed.
+
+    `notes` on the wire is `partial` — what a layer could not check (SCAN-147)
+    — not the coverage notes above, and it never touches `layers`. An empty
+    list says "checked, nothing to note"; an absent layer says nothing. The console accepts it from scan-console#72."""
+    # An empty list claims "checked, nothing to note", so a layer that did not
+    # cover anything (its coverage note is set) sends one only with lines.
+    sent = {l: note_lines(partial[l]) for l in layers
+            if l in (partial or {}) and (partial[l] or not notes.get(l))}
     out, seen = [], set()
     for f in findings:
         fp = fingerprint(f)
@@ -1030,6 +1064,7 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried,
         "layers": {l: bool(canaried and not notes.get(l)) for l in layers},
         "toolVersions": {NEEDS[l]: VERSIONS[NEEDS[l]] for l in layers},
         "findings": out,
+        **({"notes": sent} if sent else {}),
         **(head or {}),
     }
 
@@ -1096,7 +1131,7 @@ def _why(e):
 
 
 def report_to_console(args, root, layers, findings, notes, rc, started_at,
-                      canaried):
+                      canaried, partial=None):
     """Report this run to scan-console. Never raises, never touches rc; every
     way it can go wrong is exactly one line on stderr.
 
@@ -1144,7 +1179,7 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
                  "(no usable `origin` remote to derive it from). Not reported")
             return
         payload = build_payload(target, started_at, rc, layers, findings,
-                                notes, canaried, git_head(root))
+                                notes, canaried, git_head(root), partial)
         _, doc = post_report(base.rstrip("/") + "/scans/reported", token,
                              payload, REPORT_TIMEOUT)
     except Exception as e:
@@ -1284,7 +1319,8 @@ def main():
             f, n = scan_deps(tools, root, out)
             findings += f
             notes["deps"] = n
-            # Its own channel, never notes: a note turns the layer off.
+            # Its own channel, never notes: a note turns the layer off. Sent to
+            # the console as `notes` (SCAN-147), which change no coverage.
             partial["deps"] = uncovered_manifests(root)
         if "iac" in layers:
             f, n = scan_iac(tools, root, out, diff_ref)
@@ -1364,7 +1400,7 @@ def main():
     # unverified, and a layer the console believes ran resolves findings.
     sys.stdout.flush()
     report_to_console(args, root, layers, findings, notes, rc, started_at,
-                      canaried=not args.no_canary)
+                      canaried=not args.no_canary, partial=partial)
     return rc
 
 
