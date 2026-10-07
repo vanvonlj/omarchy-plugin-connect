@@ -8,11 +8,18 @@
 # the existing mechanism with no rollout.py change.
 #
 # ---------------------------------------------------------------------------
-# LICENSE — MIT Expat. Rules are taken verbatim from GitLab's SAST ruleset:
+# LICENSE — MIT Expat. Rules ABOVE the `lukejv-dev rules` marker are taken
+# verbatim from GitLab's SAST ruleset:
 #   https://gitlab.com/gitlab-org/security-products/sast-rules
 #   Copyright (c) 2011-present GitLab Inc.
 # The MIT terms require the copyright notice to travel with the rules; that is
 # what this header is for. Do not strip it.
+#
+# Rules BELOW the `# --- lukejv-dev rules (own, MIT) ---` marker (ids
+# `lukejv_*`) are our own, written from scratch for this file — MIT, copyright
+# lukejv-dev. Never copy one in from semgrep-rules (below) or from
+# opengrep/opengrep-rules (archived, stale). Each has a positive and a negative
+# fixture in ops/forgejo-ci/tests/sast-js/, checked by test_sast_rules.py.
 #
 # NOT semgrep's own `semgrep-rules` repo, and never vendor that one: it ships
 # under the Semgrep Rules License v1.0, which forbids redistribution outright.
@@ -23,11 +30,15 @@
 #
 # Regenerating (after a `git pull` of the upstream ruleset):
 #   merge every csharp/ go/ javascript/ python/ *.yml under a single `rules:`
-#   key, dropping duplicate ids. 128 rules, 16 of them mode: taint.
+#   key, dropping duplicate ids, then append EVERYTHING below the
+#   `lukejv-dev rules` marker unchanged — it is not upstream and a regenerate
+#   that drops it silently blinds the TypeScript/JavaScript layer again.
+#   140 rules: 128 upstream (16 of them mode: taint) + 12 own.
 #
-# Coverage gap worth knowing: upstream has NO rust and NO typescript rules.
-# TypeScript leans on the javascript rules; Rust (lattice, asset-library) is
-# uncovered by this layer entirely.
+# Coverage gap worth knowing: upstream has NO rust and NO typescript rules, and
+# its 11 javascript ones miss command injection, string-built SQL and disabled
+# TLS. The own rules cover those (typescript + javascript, SCAN-132); Rust
+# (lattice, asset-library) is uncovered by this layer entirely.
 rules:
 - id: csharp_cookies_rule-CookieWithoutHttpOnlyFlag
   languages:
@@ -7160,3 +7171,398 @@ rules:
     - pattern-not: xml.sax.parseString("...")
   - pattern: xml.sax.make_parser(...)
   severity: WARNING
+# --- lukejv-dev rules (own, MIT) ---
+- id: lukejv_js_cmdi_rule-child-process-exec-non-literal
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    child_process exec/execSync runs its command through a shell, and this command is not a literal.
+    Anything interpolated into it (a branch name, a path, a request field) can add `; rm -rf ~`.
+    Use execFile/spawn with an argument array and no `shell` option: `execFile('git', ['log', ref])`.
+  metadata:
+    cwe: CWE-78
+    category: security
+    shortDescription: OS command injection via child_process exec
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-inside: |
+          import { ..., $FN, ... } from '$MOD';
+          ...
+      - pattern: $FN($CMD, ...)
+      - metavariable-regex:
+          metavariable: $FN
+          regex: ^exec(?:Sync)?$
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: ^(?:node:)?child_process$
+    - patterns:
+      - pattern-inside: |
+          import { ..., $ORIG as $FN, ... } from '$MOD';
+          ...
+      - pattern: $FN($CMD, ...)
+      - metavariable-regex:
+          metavariable: $ORIG
+          regex: ^exec(?:Sync)?$
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: ^(?:node:)?child_process$
+    - patterns:
+      - pattern-either:
+        - pattern-inside: |
+            import * as $CP from '$MOD';
+            ...
+        - pattern-inside: |
+            import $CP from '$MOD';
+            ...
+        - pattern-inside: |
+            $CP = require('$MOD');
+            ...
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: ^(?:node:)?child_process$
+      - pattern-either:
+        - pattern: $CP.exec($CMD, ...)
+        - pattern: $CP.execSync($CMD, ...)
+    - patterns:
+      - pattern-inside: |
+          import { ..., exec, ... } from '$MOD';
+          ...
+      - metavariable-regex:
+          metavariable: $MOD
+          regex: ^(?:node:)?child_process$
+      - pattern-either:
+        - pattern-inside: |
+            $P = promisify(exec);
+            ...
+        - pattern-inside: |
+            $P = util.promisify(exec);
+            ...
+      - pattern: $P($CMD, ...)
+    - pattern: require('child_process').exec($CMD, ...)
+    - pattern: require('child_process').execSync($CMD, ...)
+  - pattern-not: $F("...", ...)
+  - metavariable-regex:
+      metavariable: $CMD
+      regex: '^(?!`[^`$]*`$)'
+- id: lukejv_js_cmdi_rule-child-process-shell-true
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    spawn/execFile with `shell: true` hands the command and every argument to a shell, so the
+    argument array no longer protects anything: an argument containing `$(...)` or `;` runs.
+    Drop `shell: true` and pass the program and its arguments separately.
+  metadata:
+    cwe: CWE-78
+    category: security
+    shortDescription: OS command injection via shell option
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: '$F(..., {..., shell: true, ...}, ...)'
+    - pattern: '$CP.$F(..., {..., shell: true, ...}, ...)'
+  - metavariable-regex:
+      metavariable: $F
+      regex: ^(?:spawn|spawnSync|execFile|execFileSync|fork)$
+- id: lukejv_js_sqli_rule-query-built-from-strings
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    SQL text built with a template literal or `+` is passed to a query call. Any interpolated
+    value becomes SQL. Pass values as parameters instead: `db.query('... WHERE id = $1', [id])`
+    (pg), `?` placeholders (mysql2, better-sqlite3), or `knex.raw('... = ?', [id])`.
+  metadata:
+    cwe: CWE-89
+    category: security
+    shortDescription: SQL injection via string-built query
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: $DB.$METHOD($SQL)
+    - patterns:
+      - pattern-inside: |
+          $Q = $SQL;
+          ...
+      - pattern: $DB.$METHOD($Q)
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: ^(?:query|execute|raw|prepare|whereRaw|orderByRaw|havingRaw|joinRaw|\$queryRawUnsafe|\$executeRawUnsafe)$
+  # Only a query with NO parameters argument: `query(`... ${col} ... $1`, [v])` is
+  # the dynamic-placeholder idiom, and on real code (pocket-webhook, chem-check)
+  # every such hit was a parameterised query with a built column or tuple list.
+  - metavariable-pattern:
+      metavariable: $SQL
+      pattern-either:
+      - pattern: '`...${$X}...`'
+      - pattern: '"..." + $X'
+      - pattern: '$X + "..."'
+- id: lukejv_js_eval_rule-new-function-non-literal
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  message: |
+    `new Function(...)` compiles its last argument as code, and here it is not a literal.
+    If any of it comes from input, that input runs with the process's full privileges.
+    Replace it with a lookup table or a real parser for whatever is being evaluated.
+  metadata:
+    cwe: CWE-95
+    category: security
+    shortDescription: Code injection via Function constructor
+    security-severity: Medium
+  patterns:
+  - pattern-either:
+    - pattern: new Function(...)
+    - pattern: Function(...)
+  - pattern-not: new Function(..., "...")
+  - pattern-not: Function(..., "...")
+  - pattern-not: new Function()
+  - pattern-not: Function()
+- id: lukejv_js_eval_rule-timer-with-string
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  message: |
+    setTimeout/setInterval with a string evaluates that string as code, exactly like eval.
+    Pass a function instead: `setTimeout(() => tick(), 1000)`.
+  metadata:
+    cwe: CWE-95
+    category: security
+    shortDescription: Code evaluation via timer string
+    security-severity: Medium
+  patterns:
+  - pattern-either:
+    - pattern: $T("...", ...)
+    - pattern: $T(`...`, ...)
+    - pattern: $T("..." + $X, ...)
+    - pattern: $T($X + "...", ...)
+    - pattern: $W.$T("...", ...)
+    - pattern: $W.$T(`...`, ...)
+    - pattern: $W.$T("..." + $X, ...)
+    - pattern: $W.$T($X + "...", ...)
+  - metavariable-regex:
+      metavariable: $T
+      regex: ^(?:setTimeout|setInterval)$
+- id: lukejv_js_eval_rule-vm-run-non-literal
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  message: |
+    node:vm runs this code, and the code is not a literal. vm is not a sandbox: code in a new
+    context reaches the host through `this.constructor.constructor('return process')()`.
+    Do not run untrusted code with vm; use a separate process with no privileges, or do not run it.
+  metadata:
+    cwe: CWE-95
+    category: security
+    shortDescription: Code injection via node:vm
+    security-severity: Medium
+  patterns:
+  - pattern-either:
+    - patterns:
+      - pattern-either:
+        - pattern: $VM.$RUN($CODE, ...)
+        - pattern: $RUN($CODE, ...)
+      - metavariable-regex:
+          metavariable: $RUN
+          regex: ^(?:runInNewContext|runInThisContext|runInContext|compileFunction)$
+    - pattern: new $VM.Script($CODE, ...)
+  - pattern-not: $VM.$RUN("...", ...)
+  - pattern-not: $RUN("...", ...)
+  - pattern-not: new $VM.Script("...", ...)
+  - metavariable-regex:
+      metavariable: $CODE
+      regex: '^(?!`[^`$]*`$)'
+- id: lukejv_js_tls_rule-reject-unauthorized-false
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    `rejectUnauthorized: false` turns off certificate verification on this TLS connection, so
+    anyone on the path can impersonate the server and read or change the traffic.
+    Trust the right CA instead: pass `ca: fs.readFileSync('ca.pem')` and keep verification on.
+  metadata:
+    cwe: CWE-295
+    category: security
+    shortDescription: TLS certificate verification disabled
+    security-severity: High
+  pattern-either:
+  - pattern: '{..., rejectUnauthorized: false, ...}'
+  - pattern: $X.rejectUnauthorized = false
+- id: lukejv_js_tls_rule-node-tls-reject-unauthorized
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    Setting NODE_TLS_REJECT_UNAUTHORIZED to 0 turns off certificate verification for EVERY
+    TLS connection the process makes, not just the one that needed it.
+    Remove it; trust a private CA with NODE_EXTRA_CA_CERTS or a per-connection `ca` option.
+  metadata:
+    cwe: CWE-295
+    category: security
+    shortDescription: TLS certificate verification disabled process-wide
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = $V
+    - pattern: process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = $V
+    - pattern: '{..., NODE_TLS_REJECT_UNAUTHORIZED: $V, ...}'
+  - metavariable-regex:
+      metavariable: $V
+      regex: ^['"`]?0['"`]?$
+- id: lukejv_js_jwt_rule-verify-without-algorithms
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    jwt.verify is called without an `algorithms` list, so the token's own header chooses how it
+    is checked. Pin it: `jwt.verify(token, key, { algorithms: ['RS256'] })`.
+  metadata:
+    cwe: CWE-347
+    category: security
+    shortDescription: JWT verified without pinning the algorithm
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: require('jsonwebtoken').verify(...)
+    - patterns:
+      - pattern-either:
+        - pattern-inside: |
+            import $JWT from 'jsonwebtoken';
+            ...
+        - pattern-inside: |
+            import * as $JWT from 'jsonwebtoken';
+            ...
+        - pattern-inside: |
+            $JWT = require('jsonwebtoken');
+            ...
+      - pattern: $JWT.verify(...)
+    - patterns:
+      - pattern-inside: |
+          import { ..., verify, ... } from 'jsonwebtoken';
+          ...
+      - pattern: verify(...)
+  - pattern-not: '$F($T, $K, {..., algorithms: $A, ...}, ...)'
+- id: lukejv_js_jwt_rule-decode-without-verify
+  languages:
+  - typescript
+  - javascript
+  severity: ERROR
+  message: |
+    jwt.decode reads a token WITHOUT checking its signature, and the function it is in never calls
+    verify. Anyone can forge the claims it returns. Use jwt.verify with a pinned `algorithms` list.
+  metadata:
+    cwe: CWE-345
+    category: security
+    shortDescription: JWT decoded without verification
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: require('jsonwebtoken').decode(...)
+    - patterns:
+      - pattern-either:
+        - pattern-inside: |
+            import $JWT from 'jsonwebtoken';
+            ...
+        - pattern-inside: |
+            import * as $JWT from 'jsonwebtoken';
+            ...
+        - pattern-inside: |
+            $JWT = require('jsonwebtoken');
+            ...
+      - pattern: $JWT.decode(...)
+    - patterns:
+      - pattern-inside: |
+          import { ..., decode, ... } from 'jsonwebtoken';
+          ...
+      - pattern: decode(...)
+  - pattern-not-inside: |
+      function $FN(...) {
+        ...
+        <... $V.verify(...) ...>;
+        ...
+      }
+  - pattern-not-inside: |
+      $METHOD(...) {
+        ...
+        <... $V.verify(...) ...>;
+        ...
+      }
+  - pattern-not-inside: |
+      (...) => {
+        ...
+        <... $V.verify(...) ...>;
+        ...
+      }
+- id: lukejv_ng_xss_rule-bypass-security-trust-non-literal
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  message: |
+    Angular's bypassSecurityTrust* switches off sanitising for this value, and the value is not
+    a literal. If any of it comes from a user, it is stored XSS.
+    Let Angular sanitise it (bind with [innerHTML]), or sanitise it yourself first with
+    `DomSanitizer.sanitize(SecurityContext.HTML, value)`.
+  metadata:
+    cwe: CWE-79
+    category: security
+    shortDescription: Angular sanitiser bypassed for a non-literal
+    security-severity: Medium
+  patterns:
+  - pattern: $S.$BYPASS($X)
+  - metavariable-regex:
+      metavariable: $BYPASS
+      regex: ^bypassSecurityTrust(?:Html|Style|Script|Url|ResourceUrl)$
+  - pattern-not: $S.$BYPASS("...")
+  - metavariable-regex:
+      metavariable: $X
+      regex: '^(?!`[^`$]*`$)'
+- id: lukejv_js_xss_rule-inner-html-non-literal
+  languages:
+  - typescript
+  - javascript
+  severity: WARNING
+  message: |
+    A non-literal is written to innerHTML/outerHTML, so any markup in it is parsed and its
+    event handlers run. Use `textContent` for text, or build elements with createElement.
+  metadata:
+    cwe: CWE-79
+    category: security
+    shortDescription: DOM XSS via innerHTML assignment
+    security-severity: Medium
+  patterns:
+  - pattern-either:
+    - pattern: $EL.innerHTML = $X
+    - pattern: $EL.outerHTML = $X
+    - pattern: $EL.innerHTML += $X
+    - pattern: $EL.outerHTML += $X
+  - pattern-not: $EL.$P = "..."
+  - pattern-not: $EL.$P += "..."
+  # Safe idioms, and only these: the whole value is one escape-helper call, or
+  # a template whose EVERY `${}` starts with one. `esc(a) + b` and
+  # `${esc(a)}${b}` still fire. Gap: a fully-escaped template joined by `+` to
+  # a raw value is not caught.
+  - pattern-not: $EL.$P = esc(...)
+  - pattern-not: $EL.$P = escape(...)
+  - pattern-not: $EL.$P = escapeHtml(...)
+  - pattern-not: $EL.$P = escapeHTML(...)
+  - pattern-not: $EL.$P = sanitizeHtml(...)
+  - pattern-not: $EL.$P = DOMPurify.sanitize(...)
+  - metavariable-regex:
+      metavariable: $X
+      regex: '^(?:(?![\s\S]*\$\{)[\s\S]*|[\s\S]*\$\{(?!\s*(?:esc|escape|escapeHtml|escapeHTML|sanitizeHtml|DOMPurify\.sanitize)\()[\s\S]*)$'
+  - metavariable-regex:
+      metavariable: $X
+      regex: '^(?!`[^`$]*`$)'

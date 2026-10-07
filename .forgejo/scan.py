@@ -75,7 +75,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Pinned. An unpinned bump changes what counts as a finding and can turn a repo
 # red with no commit having changed. Keep in step with the CI installer.
@@ -114,9 +114,11 @@ class LayerError(Exception):
 
 
 class Finding:
-    __slots__ = ("layer", "severity", "ident", "title", "location", "remediation")
+    __slots__ = ("layer", "severity", "ident", "title", "location", "remediation",
+                 "package")
 
-    def __init__(self, layer, severity, ident, title, location, remediation=None):
+    def __init__(self, layer, severity, ident, title, location, remediation=None,
+                 package=None):
         self.layer = layer
         self.severity = severity if severity in SEVERITY_ORDER else "INFO"
         self.ident = ident
@@ -126,6 +128,10 @@ class Finding:
         # fingerprint() hashes the title, so guidance there would change the
         # identity of every finding the day the guidance changed.
         self.remediation = remediation
+        # deps only: "name (ecosystem)", the package without its version.
+        # fingerprint() keys on it instead of the title, which carries the
+        # version for display.
+        self.package = package
 
 
 def find_tool(name):
@@ -434,6 +440,39 @@ def fixed_version(pkg, ids, vulns):
     return max(best, key=version_key) if best else None
 
 
+def advisory_id(ids):
+    """One id for an advisory group, stable when osv adds an alias.
+
+    Not ids[0]: osv orders a group as it likes, and a GO- or PYSEC- entry that
+    gains a GHSA or CVE alias is not a new vulnerability. So an ecosystem
+    database's id wins, then a GHSA, then a CVE, and the lowest within a rank.
+    Aliases land in that direction, so the id a finding was first seen with
+    stays the pick."""
+    # ponytail: an ecosystem entry created LATER for an existing GHSA (rare)
+    # still moves the id; a per-ecosystem preference fixes that if it is seen.
+    rank = {"GHSA": 1, "CVE": 2}
+    return min(ids, key=lambda i: (rank.get(i.split("-")[0], 0), i)) if ids else "?"
+
+
+OSV_LABEL = {"CRITICAL": "CRITICAL", "HIGH": "HIGH", "MODERATE": "MEDIUM",
+             "MEDIUM": "MEDIUM", "LOW": "LOW", "NEGLIGIBLE": "LOW"}
+# Ubuntu's "untriaged"/"unknown" are not ratings: they stay unscored, so HIGH.
+
+
+def advisory_label(ids, vulns):
+    """The highest severity label any advisory in the group gives itself, or
+    None: GHSA's `database_specific.severity` (MODERATE = MEDIUM), or a
+    `severity[].score` that is a word (osv's Ubuntu type) rather than a
+    vector. A CVSS vector is skipped: osv-scanner already folds those into
+    `max_severity`, so one here would have scored the group."""
+    found = [OSV_LABEL.get(str(x or "").strip().upper())
+             for v in vulns if v.get("id") in ids
+             for x in [(v.get("database_specific") or {}).get("severity"),
+                       *(s.get("score") for s in lst(v, "severity"))]]
+    found = [x for x in found if x]
+    return min(found, key=SEVERITY_ORDER.index) if found else None
+
+
 def osv_source_scan(tools, root, out, extra=()):
     """One osv-scanner pass over root. Returns (findings, set of lockfile paths).
 
@@ -453,21 +492,30 @@ def osv_source_scan(tools, root, out, extra=()):
         for p in lst(r, "packages"):
             info = p.get("package") or {}
             for g in lst(p, "groups"):
+                ids = g.get("ids") or []
                 try:
-                    score = float(g.get("max_severity") or 0)
+                    score = float(g.get("max_severity") or "")
+                    if not 0 < score <= 10:   # 0, negative, nan, inf: no score
+                        raise ValueError(score)
+                    sev = ("CRITICAL" if score >= 9 else "HIGH" if score >= 7
+                           else "MEDIUM" if score >= 4 else "LOW")
+                    rating = f"CVSS {score:.1f}"
                 except ValueError:
-                    score = 0.0
-                sev = ("CRITICAL" if score >= 9 else "HIGH" if score >= 7
-                       else "MEDIUM" if score >= 4 else "LOW")
-                ids = g.get("ids") or ["?"]
+                    # No CVSS (the Go database scores nothing): the advisory's
+                    # own label if it has one, else HIGH (SCAN-144) — never
+                    # LOW, which would hide it from every channel.
+                    label = advisory_label(ids, lst(p, "vulnerabilities"))
+                    sev = label or "HIGH"
+                    rating = f"rated {label}" if label else "unscored"
                 fix = fixed_version(info, ids, lst(p, "vulnerabilities"))
                 findings.append(Finding(
-                    "deps", sev, ids[0],
+                    "deps", sev, advisory_id(ids),
                     f"{info.get('name','?')} {info.get('version','')} "
-                    f"({info.get('ecosystem','?')}) CVSS {score:.1f}",
+                    f"({info.get('ecosystem','?')}) {rating}",
                     rel(src, root),
                     f"Upgrade {info.get('name','?')} to {fix} or later" if fix
-                    else "No fixed version published"))
+                    else "No fixed version published",
+                    f"{info.get('name','?')} ({info.get('ecosystem','?')})"))
     return findings, sources
 
 
@@ -510,6 +558,88 @@ def scan_deps(tools, root, out):
         note = ("no lockfile found, so NOTHING was checked for dependency "
                 "vulnerabilities — uncovered, not clean")
     return findings, note
+
+
+NPM_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+             "pnpm-lock.yaml", "bun.lock"}
+PY_LOCKS = {"poetry.lock", "uv.lock", "Pipfile.lock", "pdm.lock", "pylock.toml"}
+
+
+def uncovered_manifests(root):
+    """[(path, reason)] for each manifest osv-scanner cannot fully check.
+
+    One lockfile anywhere marks the deps layer covered, while osv-scanner
+    silently skips a package.json or pyproject.toml with no lockfile, reads a
+    .csproj's direct dependencies only, and resolves a `>=` requirement to the
+    lowest version it allows (SCAN-145, probed on 2.5.1). This names them. It
+    is a note, never a failure and never a coverage change: see build_payload.
+
+    Enumerated with `git ls-files` (tracked, plus untracked-not-ignored), so
+    .gitignore holds as it does for the scan; no repo, no list. A lockfile in
+    an ancestor directory covers a nested package only when that ancestor
+    declares a workspace (npm/yarn `workspaces`, pnpm-workspace.yaml,
+    `[tool.uv.workspace]`): a root lockfile does not cover an unrelated
+    sub-project. node_modules never counts. Paths are root-relative;
+    report() redacts them."""
+    rc, so, _ = run(["git", "-C", str(root), "ls-files", "-z", "-c", "-o",
+                     "--exclude-standard"])
+    if rc != 0:
+        return []
+    files = {PurePosixPath(p) for p in so.split("\0")
+             if p and "node_modules" not in PurePosixPath(p).parts
+             and (root / p).is_file()}
+    names = {}                                 # dir -> file names in it
+    for f in files:
+        names.setdefault(f.parent, set()).add(f.name)
+
+    def read(f):
+        try:
+            return (root / f).read_text(errors="replace")
+        except OSError:
+            return None
+
+    def workspace(a):
+        # ponytail: any declared workspace covers every manifest below it,
+        # without matching its member globs; match them if a gap hides there.
+        here = names.get(a, set())
+        if "pnpm-workspace.yaml" in here:
+            return True
+        if "package.json" in here:
+            try:
+                if "workspaces" in json.loads(read(a / "package.json") or "{}"):
+                    return True
+            except (ValueError, TypeError):
+                pass
+        return ("pyproject.toml" in here
+                and "[tool.uv.workspace]" in (read(a / "pyproject.toml") or ""))
+
+    def locked(d, locks):
+        return bool(names.get(d, set()) & locks) or any(
+            names.get(a, set()) & locks and workspace(a) for a in d.parents)
+
+    gaps = []
+    for f in sorted(files):
+        d, n = f.parent, f.name
+        if n == "package.json" and not locked(d, NPM_LOCKS):
+            gaps.append((str(f), "no lockfile"))
+        elif n in ("pyproject.toml", "setup.py", "Pipfile") and not locked(d, PY_LOCKS):
+            gaps.append((str(f), "no lockfile"))
+        elif n.endswith(".csproj") and "packages.lock.json" not in names[d]:
+            gaps.append((str(f), "direct dependencies only"))
+        elif n.startswith("requirements") and n.endswith(".txt"):
+            text = read(f)
+            if text is None:   # a note must never crash the scan before its gate
+                gaps.append((str(f), "unreadable"))
+                continue
+            loose = 0
+            for line in text.splitlines():
+                req = line.split("#")[0].split(";")[0].strip()
+                # `==1.*` and `pkg @ url` are not pins osv-scanner can check.
+                if req and not req.startswith("-") and ("==" not in req or "*" in req):
+                    loose += 1
+            if loose:
+                gaps.append((str(f), f"not pinned ({loose} line{'s' * (loose > 1)})"))
+    return gaps
 
 
 def touched_paths(root, diff_ref):
@@ -685,7 +815,7 @@ LAYER_TITLE = {
 }
 
 
-def report(findings, notes, layers, fmt, diff_ref, limit=20):
+def report(findings, notes, layers, fmt, diff_ref, limit=20, partial=None):
     lines, md = [], fmt == "markdown"
     scope = f"changes since {diff_ref}" if diff_ref else "whole tree"
     lines.append(f"# Scan report ({scope})" if md else f"\nScan report — {scope}")
@@ -697,9 +827,21 @@ def report(findings, notes, layers, fmt, diff_ref, limit=20):
         lines.append(f"\n## {t}" if md else f"\n{t}\n{'-' * len(t)}")
         if notes.get(layer):
             lines.append(f"**{notes[layer]}**" if md else f"!! {notes[layer]}")
+        gaps = (partial or {}).get(layer) or []
+        if gaps:
+            head = (f"{len(gaps)} manifest(s) not checked:" if notes.get(layer)
+                    else f"{len(gaps)} manifest(s) not fully checked — partial "
+                         "coverage, not a failure:")
+            lines.append(f"{head}\n" if md else f"?? {head}")
+            lines += [f"- `{redact(p)}` — {why}" if md else f"   {redact(p)} — {why}"
+                      for p, why in gaps[:limit]]
+            if len(gaps) > limit:
+                lines.append(f"- … {len(gaps) - limit} more" if md
+                             else f"   … {len(gaps) - limit} more")
         if not fs:
             if not notes.get(layer):
-                lines.append("Nothing found.")
+                lines.append("No findings in what was checked." if gaps
+                             else "Nothing found.")
             continue
         counts = {s: sum(1 for f in fs if f.severity == s) for s in SEVERITY_ORDER}
         lines.append(", ".join(f"{v} {k}" for k, v in counts.items() if v))
@@ -765,14 +907,17 @@ def fingerprint(f):
 
     No line number, on purpose: the same problem shifted three lines is the same
     problem, and a fingerprint that moved with it would resolve and re-open
-    every finding above an edit. A deps title's trailing CVSS is dropped for
-    the same reason — an advisory being re-scored is not a new vulnerability.
+    every finding above an edit. A deps finding keys on its package name and
+    ecosystem, never the title: the title carries the installed version and
+    the CVSS, and neither a bump that is still affected nor a re-score is a
+    new vulnerability (SCAN-143). So one finding covers every installed
+    version of the package in that lockfile (a hoisted and a nested copy), and
+    it resolves only when none is affected; its title and fix hint are the
+    first copy osv lists (build_payload keeps the first).
 
     Two hits of one rule in one file therefore share a fingerprint and report
     as one finding. That is the price of not keying on the line."""
-    title = redact(f.title).strip().lower()
-    if f.layer == "deps":
-        title = re.sub(r"\s+cvss\s+[\d.]+$", "", title)
+    title = redact(f.package or f.title).strip().lower()
     key = f"{f.layer}\n{f.ident or ''}\n{finding_path(f.location)}\n{title}"
     # sha256 for the reason review.py gives: a scanner flags sha1 on sight.
     return hashlib.sha256(key.encode()).hexdigest()[:12]
@@ -1060,7 +1205,8 @@ def main():
     ap.add_argument("--format", choices=["text", "markdown"], default="text")
     ap.add_argument("--fail-cvss", type=float, default=9.0,
                     help="fail on a dependency CVE at or above this CVSS "
-                         "(default 9.0; above 10 disables)")
+                         "(default 9.0; above 10 disables). With no CVSS "
+                         "published, an advisory rated CRITICAL counts too")
     ap.add_argument("--fail-on", action="append", choices=LAYERS, default=[],
                     metavar="LAYER", help="also fail on any finding in LAYER")
     ap.add_argument("--allow-uncovered", action="store_true",
@@ -1123,7 +1269,7 @@ def main():
     if not args.no_canary:
         canary(tools, layers, args.quiet)
 
-    findings, notes, broken = [], {}, []
+    findings, notes, broken, partial = [], {}, [], {}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out.json"
         if "secrets" in layers:
@@ -1138,6 +1284,8 @@ def main():
             f, n = scan_deps(tools, root, out)
             findings += f
             notes["deps"] = n
+            # Its own channel, never notes: a note turns the layer off.
+            partial["deps"] = uncovered_manifests(root)
         if "iac" in layers:
             f, n = scan_iac(tools, root, out, diff_ref)
             findings += f
@@ -1147,7 +1295,7 @@ def main():
             findings += f
             notes["sast"] = n
 
-    print(report(findings, notes, layers, args.format, diff_ref))
+    print(report(findings, notes, layers, args.format, diff_ref, partial=partial))
 
     # ---- the gate ---------------------------------------------------------
     # Whole-tree runs gate NARROWLY. Secrets are binary, so any hit fails.
@@ -1178,8 +1326,13 @@ def main():
     crit = [f for f in findings
             if f.layer == "deps" and f.severity == "CRITICAL"]
     if crit and args.fail_cvss <= 10:
+        # CRITICAL is CVSS >= 9, or the advisory's own CRITICAL label when
+        # osv has no score for it (SCAN-144) — say which, not a score it lacks.
+        rated = sum(1 for f in crit if f.title.endswith(" rated CRITICAL"))
         reasons.append(f"{len(crit)} dependency vulnerabilit(y/ies) at "
-                       f"CVSS >= {args.fail_cvss}")
+                       f"CVSS >= {args.fail_cvss}"
+                       + (f" ({rated} rated CRITICAL by the advisory, no CVSS)"
+                          if rated else ""))
     for layer in args.fail_on:
         n = sum(1 for f in findings if f.layer == layer)
         if n:

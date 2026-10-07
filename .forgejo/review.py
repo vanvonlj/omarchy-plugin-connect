@@ -332,7 +332,10 @@ def findings_state(comments, issue_comments):
             # finding gone from the count, and one marker closing both.
             if fid in found:
                 fid = f"c{c['id']}"
-            title = body.split("\n", 1)[0].rsplit(" · ", 1)[-1].strip()
+            # Strip "**F1** · " and "🔴 **High** · " only: a title may itself
+            # contain " · ".
+            title = re.sub(r"^(\*\*F\d+\*\* · )?\S+ \*\*\w+\*\* · ", "",
+                           body.split("\n", 1)[0]).strip()
             found[fid] = {"title": title, "url": c.get("html_url", ""),
                           "state": "resolved" if c.get("resolver") else "open",
                           "reason": ""}
