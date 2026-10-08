@@ -62,7 +62,8 @@ report and exit code are exactly what they would have been without it.
 - Plain `http://` is refused except to localhost. No matched secret text is
   sent — betterleaks runs with `--redact` and only rule, title and location go.
 
-In CI only the weekly default-branch run reports, and only once the org has
+In CI only the default branch reports — every push to it (a merge) and the
+weekly dispatch — and only once the org has
 variable `SCAN_CONSOLE_URL` and secret `SCAN_CONSOLE_TOKEN`. Pull-request runs
 never report and never see the token.
 
@@ -122,7 +123,7 @@ allowlist it in your own `.betterleaks.toml`, never in the managed default.
 | workflow | when | gate |
 |---|---|---|
 | `secret-scan.yml` | every push, every branch | **fails on any secret** |
-| `code-scan.yml` | pull requests + weekly | fails on a CRITICAL dependency CVE |
+| `code-scan.yml` | pull requests, pushes to the default branch, weekly | fails on a CRITICAL dependency CVE |
 
 The weekly run is dispatched from a CronJob in the cluster, not a `schedule:`
 trigger — a `schedule:` stops Forgejo registering the workflow on any

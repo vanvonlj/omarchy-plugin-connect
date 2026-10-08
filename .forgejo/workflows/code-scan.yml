@@ -31,6 +31,13 @@ name: Code scan
 # committed, but a dependency CVE is not a property of your commit at all — it
 # lands when somebody else publishes an advisory against code nobody touched.
 #
+# A PUSH TO THE DEFAULT BRANCH DOES RUN IT, and reports (SCAN-140): that push
+# is a merge, and without it a fix stays open in scan-console until the next
+# weekly run. `on.push.branches` cannot name "the default branch" — it differs
+# per repo and this file is the same in all of them — so `push` is unfiltered
+# and the job's `if:` skips every other branch before anything installs. A
+# skipped job costs no runner time.
+
 # THE PERIODIC RUN IS NOT HERE, AND CANNOT BE. A `schedule:` trigger stops
 # Forgejo registering this workflow AT ALL on any branch that is not the default
 # branch — not just the cron, the whole file, `pull_request` included. Verified
@@ -43,22 +50,36 @@ name: Code scan
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
   workflow_dispatch:
+
+# One run per repo and ref at a time, never cancelled once running: merges must
+# report in order, because scan-console picks a scan's "previous scan" when it
+# is written (SCAN-95), and Forgejo otherwise cancels an older push run on the
+# same ref. The weekly dispatch shares the default branch's group. A group holds
+# one running and one pending run, so a third arrival replaces the pending one:
+# that skips a scan, never reorders one, and the newer whole-tree scan covers
+# everything the skipped one would have.
+concurrency:
+  group: code-scan-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   code-scan:
     # Needs python3 for scan.py itself; opengrep is a static binary.
+    # A push to any branch but the default one is skipped here (see the top).
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # 'true' only for the weekly run: a dispatch of the default branch, which
-      # is what rke2/forgejo/15-code-scan-cronjob.yaml fires, with the org
-      # variable set. A PR never reports — its branch reported to the same
+      # 'true' only for a dispatch or a push of the default branch, with the
+      # org variable set: the weekly run (rke2/forgejo/15-code-scan-cronjob.yaml
+      # dispatches it) and every merge. A PR never reports — its branch reported to the same
       # target would mark findings fixed that still exist on the default
       # branch. A missing default_branch makes this false, not true. No secret
       # here: the token goes only into the env of the one step gated on this.
       # Delete the org variable SCAN_CONSOLE_URL to turn reporting off.
-      REPORT_TO_CONSOLE: ${{ github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.SCAN_CONSOLE_URL != '' }}
+      REPORT_TO_CONSOLE: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.SCAN_CONSOLE_URL != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -105,8 +126,17 @@ jobs:
         # dependency CVE fails, IaC and SAST report. Their first-run backlogs
         # run to hundreds and a permanently red check is worth as much as no
         # check. Tighten per repo with --fail-on once a backlog is triaged.
+        #
+        # The echo is so a run that did not report says so in its log, with the
+        # inputs to the gate, instead of leaving "why not?" to be worked out.
+        # Through env, not ${{ }} in the script: a branch name is user input.
         if: env.REPORT_TO_CONSOLE != 'true'
-        run: python3 .forgejo/scan.py --format markdown .
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONSOLE_URL_SET: ${{ vars.SCAN_CONSOLE_URL != '' }}
+        run: |
+          echo "scan-console: not reported (event=$GITHUB_EVENT_NAME ref=$GITHUB_REF default_branch=${DEFAULT_BRANCH:-?} SCAN_CONSOLE_URL set=$CONSOLE_URL_SET; only a push or dispatch of the default branch with it set reports)"
+          python3 .forgejo/scan.py --format markdown .
 
       - name: Scan and report to scan-console
         # The same command as "Scan" above — exactly one of the two runs. With
