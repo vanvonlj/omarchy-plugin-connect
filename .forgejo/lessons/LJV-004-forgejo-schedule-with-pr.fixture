@@ -1,0 +1,20 @@
+# Fixture for LJV-004 (see LJV-001's fixture for the comment format).
+name: code-scan
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # ruleid: LJV-004
+  schedule:
+    - cron: "0 3 * * 1"
+---
+name: flow-style
+# ruleid: LJV-004
+on: {pull_request: {}, schedule: [{cron: "0 3 * * *"}]}
+---
+name: nightly
+on:
+  # ok: LJV-004
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:

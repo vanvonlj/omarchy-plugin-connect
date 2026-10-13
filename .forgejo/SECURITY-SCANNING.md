@@ -14,13 +14,18 @@ metered, and no code leaves the network — only rule and CVE metadata come in.
 ```bash
 scan --diff          # only what THIS change introduced  ← use this by default
 scan                 # whole tree
-scan --only secrets  # one layer: secrets | deps | iac | sast
+scan --only secrets  # one layer: secrets | deps | iac | sast | lessons
 scan --history       # secrets across all git history
 ```
 
 A git worktree parked under a gitignored `.worktrees/` is covered too: osv-scanner
 honours ancestor `.gitignore` files, so `scan_deps()` retries with `--no-ignore`
 when the first pass finds no lockfile.
+
+`lessons` is our own anti-pattern rules, `LJV-NNN` (e.g. LJV-001, non-secret
+data in a k8s Secret): a backlog, not a PR gate. They run in a whole-tree
+`scan` only, never in `--diff` or a PR's CI. Each finding's message says the fix
+and links its entry on https://docs.lukejv.com/architecture/anti-patterns/.
 
 If `scan` is not on PATH, `python3 .forgejo/scan.py --diff` is identical — the
 wrapper only locates this file.

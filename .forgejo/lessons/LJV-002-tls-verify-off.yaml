@@ -1,0 +1,23 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-002 — TLS verification turned off (SCAN-153, from HLP-341: 21
+# noTLSVerify rules in the old Cloudflare tunnel, each hiding a broken origin).
+rules:
+- id: LJV-002
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    TLS verification turned off (`noTLSVerify` / `insecureSkipVerify`).
+
+    It turns a loud failure (bad cert, wrong origin) into a silent one, and a
+    502 is never a reason to add it. Fix: give the origin a cert-manager
+    Certificate and point at it by its real name, or trust its CA (`caFile`,
+    a ServersTransport `rootCAs`). A self-signed listener with nothing better:
+    keep it with `# nosemgrep: LJV-002` and the reason.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-002-tls-verification-turned-off
+  metadata:
+    lesson: LJV-002
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-002-tls-verification-turned-off
+  # camelCase, snake_case and kubeconfig's insecure-skip-tls-verify.
+  pattern-regex: (?i)(no[_-]?tls[_-]?verify|insecure[_-]?skip[_-]?(tls[_-]?)?verify)["']?\s*[:=]\s*["']?true\b

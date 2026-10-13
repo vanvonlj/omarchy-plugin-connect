@@ -1,0 +1,25 @@
+# Fixture for LJV-002 (see LJV-001's fixture for the comment format).
+ingress:
+  - hostname: app.lukejv.com
+    service: https://app.app.svc:443
+    originRequest:
+      # ruleid: LJV-002
+      noTLSVerify: true
+  - hostname: ok.lukejv.com
+    originRequest:
+      # ok: LJV-002
+      noTLSVerify: false
+spec:
+  endpoints:
+    - tlsConfig:
+        # ruleid: LJV-002
+        insecureSkipVerify: true
+        # ok: LJV-002
+        caFile: /etc/ca.crt
+clusters:
+  - cluster:
+      # ruleid: LJV-002
+      insecure-skip-tls-verify: true
+args:
+  # ruleid: LJV-002
+  - --serversTransport.insecureSkipVerify=true

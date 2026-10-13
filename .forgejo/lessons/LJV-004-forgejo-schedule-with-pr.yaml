@@ -1,0 +1,31 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-004 — a Forgejo workflow with both `schedule:` and `pull_request:`
+# (SCAN-153, from 2026-09-04: Forgejo stops registering a workflow with a
+# schedule on any non-default branch, its pull_request trigger included, and
+# says nothing). .github/workflows is NOT excluded: Forgejo runs it when a
+# repo has no .forgejo/workflows.
+rules:
+- id: LJV-004
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    Forgejo workflow has both `schedule:` and `pull_request:`, so it never runs on a PR.
+
+    Forgejo evaluates pull_request workflows from the head branch, and a
+    workflow with a schedule does not register off the default branch at all.
+    No error, just no run. Fix: split it into two files, or drop the schedule
+    and dispatch it from outside (rke2/forgejo/15-code-scan-cronjob.yaml).
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-004-scheduled-forgejo-workflow-skips-prs
+  metadata:
+    lesson: LJV-004
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-004-scheduled-forgejo-workflow-skips-prs
+  patterns:
+  - pattern-inside: |
+      on:
+        ...
+        pull_request: $P
+        ...
+  - pattern: |
+      schedule: $S

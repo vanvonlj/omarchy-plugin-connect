@@ -54,6 +54,11 @@ WHAT EACH LAYER ACTUALLY COVERS — read this before trusting a clean result:
            which is why this layer moved off it (measured 2026-09-11).
            Still NOT cross-FILE: a source in a.py reaching a sink in b.py is
            invisible. That is opengrep's paid-tier equivalent everywhere.
+  lessons  opengrep again, against our own rules in lessons/ — one file per
+           anti-pattern we learned the hard way (LJV-NNN, SCAN-153). Each rule
+           ships with a .fixture the canary runs every time. Whole-tree only:
+           never in --diff or a pull_request CI run, because a lesson is a
+           backlog to work through, not a PR gate. See canary_lessons().
 
 EVERY TOOL HERE FAILS OPEN. opengrep with no rules, osv-scanner with no network,
 trivy with no checks bundle and betterleaks with a stale binary all exit 0 and
@@ -87,14 +92,17 @@ VERSIONS = {
 }
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
-LAYERS = ["secrets", "deps", "iac", "sast"]
+LAYERS = ["secrets", "deps", "iac", "sast", "lessons"]
+# What scan-console accepts (it 400s an unknown layer). `lessons` is not one
+# yet, so build_payload() leaves it out rather than lose the whole report.
+CONSOLE_LAYERS = ["secrets", "deps", "iac", "sast"]
 
 # Where the tools might be, beyond PATH. betterleaks is commonly left behind by
 # a Rafter install; it is a standalone binary and needs nothing from Rafter.
 EXTRA_BINS = [Path.home() / ".rafter/bin", Path.home() / ".local/bin"]
 
 NEEDS = {"secrets": "betterleaks", "deps": "osv-scanner",
-         "iac": "trivy", "sast": "opengrep"}
+         "iac": "trivy", "sast": "opengrep", "lessons": "opengrep"}
 
 # opengrep has NO rules registry — p/default and friends resolve against
 # semgrep.dev and simply do not exist here. Rules ship beside this file and are
@@ -102,6 +110,10 @@ NEEDS = {"secrets": "betterleaks", "deps": "osv-scanner",
 # empty ruleset scans clean, which is the exact fail-open this tool exists to
 # prevent.
 RULES = Path(__file__).resolve().parent / "sast-rules.yml"
+
+# Lesson rules, one `LJV-NNN-<slug>.yaml` per lesson plus its `.fixture`. Synced
+# by rollout.py as its own file set. Missing is fatal, same reason as RULES.
+LESSONS = Path(__file__).resolve().parent / "lessons"
 
 # Connection-string password rules every repo gets (SCAN-87), synced beside
 # this file the same way. See secrets_config().
@@ -275,6 +287,9 @@ def canary(tools, layers, quiet):
                 problems.append("opengrep found nothing in a shell=True subprocess "
                                 f"— its rules did not load from {RULES}")
 
+        if "lessons" in layers:
+            problems += canary_lessons(tools, d)
+
     if problems:
         sys.stderr.write("\nCANARY FAILED — this is not a clean scan, it is a "
                          "broken one:\n")
@@ -285,6 +300,48 @@ def canary(tools, layers, quiet):
         sys.exit(2)
     if not quiet:
         print(f"canary ok ({', '.join(sorted(layers))})")
+
+
+def canary_lessons(tools, tmp):
+    """Every lesson rule against its own fixture: each `# ruleid: X` line must
+    be reported on the next line and each `# ok: X` line must not. This is the
+    lessons canary AND its test suite, so a rule that stops matching fails
+    every scan instead of going quietly blind."""
+    problems, want, ok = [], set(), set()
+    rules = sorted(LESSONS.glob("*.yaml"))
+    if not rules:
+        return [f"no lesson rules in {LESSONS}"]
+    fx = tmp / "lessons"
+    fx.mkdir()
+    for rule in rules:
+        fixture = rule.with_suffix(".fixture")
+        if not fixture.is_file():
+            problems.append(f"{rule.name} has no {fixture.name}")
+            continue
+        text = fixture.read_text()
+        (fx / f"{rule.stem}.yaml").write_text(text)
+        marks = {"ruleid": set(), "ok": set()}
+        for n, line in enumerate(text.splitlines(), 1):
+            m = re.search(r"#\s*(ruleid|ok):\s*(\S+)", line)
+            if m:
+                marks[m[1]].add((rule.stem, n + 1, m[2]))
+        rid = "-".join(rule.stem.split("-")[:2])        # LJV-001-slug -> LJV-001
+        for kind, found in marks.items():
+            if not any(r == rid for _, _, r in found):
+                problems.append(f"{fixture.name} has no `# {kind}: {rid}` line")
+        want |= marks["ruleid"]
+        ok |= marks["ok"]
+    out = tmp / "lessons.json"
+    run([tools["opengrep"], "scan", "--config", str(LESSONS), "--quiet",
+         "--json", "--output", str(out), str(fx)])
+    got = {(Path(x.get("path", "")).stem, (x.get("start") or {}).get("line"),
+            (x.get("check_id") or "?").split(".")[-1])
+           for x in lst(load_json(out), "results")}
+    for s, n, r in sorted(want - got):
+        problems.append(f"lesson {r} missed its positive at {s}.fixture:{n}")
+    for s, n, r in sorted(ok & got):
+        problems.append(f"lesson {r} matched its negative at {s}.fixture:{n}")
+    return problems
 
 
 # --------------------------------------------------------------------------
@@ -563,6 +620,11 @@ def scan_deps(tools, root, out):
 NPM_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
              "pnpm-lock.yaml", "bun.lock"}
 PY_LOCKS = {"poetry.lock", "uv.lock", "Pipfile.lock", "pdm.lock", "pylock.toml"}
+NPM_DEP_KEYS = ("dependencies", "devDependencies", "optionalDependencies",
+                "peerDependencies")
+# MSBuild files above a .csproj that can add PackageReferences to it.
+MSBUILD_IMPORTS = {"Directory.Build.props", "Directory.Build.targets",
+                   "Directory.Packages.props"}
 
 
 def uncovered_manifests(root):
@@ -579,8 +641,9 @@ def uncovered_manifests(root):
     an ancestor directory covers a nested package only when that ancestor
     declares a workspace (npm/yarn `workspaces`, pnpm-workspace.yaml,
     `[tool.uv.workspace]`): a root lockfile does not cover an unrelated
-    sub-project. node_modules never counts. Paths are root-relative;
-    report() redacts them."""
+    sub-project. node_modules never counts. A package.json or .csproj that
+    declares no dependency has nothing to lock and is not listed (SCAN-156).
+    Paths are root-relative; report() redacts them."""
     rc, so, _ = run(["git", "-C", str(root), "ls-files", "-z", "-c", "-o",
                      "--exclude-standard"])
     if rc != 0:
@@ -617,14 +680,32 @@ def uncovered_manifests(root):
         return bool(names.get(d, set()) & locks) or any(
             names.get(a, set()) & locks and workspace(a) for a in d.parents)
 
+    def declares_deps(f):
+        # Unreadable or unparseable counts as declaring: a false gap beats a
+        # hidden one.
+        text = read(f)
+        if text is None:
+            return True
+        if f.name == "package.json":
+            try:
+                return any(json.loads(text).get(k) for k in NPM_DEP_KEYS)
+            except (ValueError, TypeError, AttributeError):
+                return True
+        # `PackageReference` also matches GlobalPackageReference.
+        return "PackageReference" in text or any(
+            "PackageReference" in (read(a / m) or "")
+            for a in (f.parent, *f.parent.parents)
+            for m in names.get(a, set()) & MSBUILD_IMPORTS)
+
     gaps = []
     for f in sorted(files):
         d, n = f.parent, f.name
-        if n == "package.json" and not locked(d, NPM_LOCKS):
+        if n == "package.json" and not locked(d, NPM_LOCKS) and declares_deps(f):
             gaps.append((str(f), "no lockfile"))
         elif n in ("pyproject.toml", "setup.py", "Pipfile") and not locked(d, PY_LOCKS):
             gaps.append((str(f), "no lockfile"))
-        elif n.endswith(".csproj") and "packages.lock.json" not in names[d]:
+        elif (n.endswith(".csproj") and "packages.lock.json" not in names[d]
+              and declares_deps(f)):
             gaps.append((str(f), "direct dependencies only"))
         elif n.startswith("requirements") and n.endswith(".txt"):
             text = read(f)
@@ -779,9 +860,9 @@ def scan_iac(tools, root, out, diff_ref):
 SEMGREP_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
 
 
-def scan_sast(tools, root, out, diff_ref):
+def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
     # No --metrics flag: opengrep removed telemetry entirely and errors on it.
-    cmd = [tools["opengrep"], "scan", "--config", str(RULES),
+    cmd = [tools["opengrep"], "scan", "--config", str(config),
            "--taint-intrafile", "--quiet", "--json", "--output", str(out)]
     if diff_ref:
         cmd += ["--baseline-commit", diff_ref]
@@ -792,7 +873,7 @@ def scan_sast(tools, root, out, diff_ref):
         extra = x.get("extra") or {}
         message = (extra.get("message") or "").strip()
         findings.append(Finding(
-            "sast", SEMGREP_SEV.get(extra.get("severity"), "LOW"),
+            layer, SEMGREP_SEV.get(extra.get("severity"), "LOW"),
             (x.get("check_id") or "?").split(".")[-1],
             message.split("\n")[0][:100],
             f"{rel(x.get('path'), root)}:"
@@ -812,6 +893,7 @@ LAYER_TITLE = {
     "deps": "Dependency vulnerabilities",
     "iac": "Infrastructure misconfiguration",
     "sast": "Static analysis",
+    "lessons": "Lessons (LJV rules)",
 }
 
 
@@ -1035,6 +1117,8 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried,
     `notes` on the wire is `partial` — what a layer could not check (SCAN-147)
     — not the coverage notes above, and it never touches `layers`. An empty
     list says "checked, nothing to note"; an absent layer says nothing. The console accepts it from scan-console#72."""
+    layers = [l for l in layers if l in CONSOLE_LAYERS]
+    findings = [f for f in findings if f.layer in CONSOLE_LAYERS]
     # An empty list claims "checked, nothing to note", so a layer that did not
     # cover anything (its coverage note is set) sends one only with lines.
     sent = {l: note_lines(partial[l]) for l in layers
@@ -1231,8 +1315,8 @@ def main():
     ap.add_argument("path", nargs="?", default=".", help="directory to scan")
     ap.add_argument("--diff", nargs="?", const="origin/main", metavar="REF",
                     help="only what changed since REF (default origin/main). "
-                         "Applies to secrets, SAST and IaC; deps is whole-tree "
-                         "either way.")
+                         "Applies to secrets, SAST and IaC; deps is "
+                         "whole-tree either way, and lessons never runs.")
     ap.add_argument("--history", action="store_true",
                     help="secrets: scan all git history, not the working tree")
     ap.add_argument("--only", action="append", choices=LAYERS, default=[],
@@ -1265,6 +1349,15 @@ def main():
 
     root = Path(args.path).resolve()
     layers = args.only or LAYERS
+    # Lessons are a backlog for a whole-tree `scan`, not a PR gate (Lucas,
+    # SCAN-153): no --diff run and no pull_request CI run ever shows them.
+    in_pr = os.environ.get("GITHUB_EVENT_NAME", "").startswith("pull_request")
+    if "lessons" in layers and (args.diff or in_pr):
+        if args.only == ["lessons"]:
+            sys.stderr.write("error: lessons runs whole-tree only: "
+                             "`scan --only lessons`, without --diff.\n")
+            return 2
+        layers = [l for l in layers if l != "lessons"]
 
     tools, missing = {}, {}
     for layer in layers:
@@ -1283,6 +1376,13 @@ def main():
             "without this file the sast layer would scan clean and mean\n"
             "nothing. Restore it from ops/forgejo-ci/files/sast-rules.yml, or "
             "narrow the run with --only.\n")
+        return 2
+
+    if "lessons" in layers and not LESSONS.is_dir():
+        sys.stderr.write(
+            f"error: lesson rules not found at {LESSONS}\n"
+            "Restore them from ops/forgejo-ci/files/lessons/, or narrow the run "
+            "with --only.\n")
         return 2
 
     if missing:
@@ -1330,6 +1430,10 @@ def main():
             f, n = scan_sast(tools, root, out, diff_ref)
             findings += f
             notes["sast"] = n
+        if "lessons" in layers:
+            f, n = scan_sast(tools, root, out, diff_ref, LESSONS, "lessons")
+            findings += f
+            notes["lessons"] = n
 
     print(report(findings, notes, layers, args.format, diff_ref, partial=partial))
 
