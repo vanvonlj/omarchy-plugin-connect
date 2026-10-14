@@ -33,12 +33,13 @@
 #   key, dropping duplicate ids, then append EVERYTHING below the
 #   `lukejv-dev rules` marker unchanged — it is not upstream and a regenerate
 #   that drops it silently blinds the TypeScript/JavaScript layer again.
-#   140 rules: 128 upstream (16 of them mode: taint) + 12 own.
+#   141 rules: 128 upstream (16 of them mode: taint) + 13 own.
 #
 # Coverage gap worth knowing: upstream has NO rust and NO typescript rules, and
 # its 11 javascript ones miss command injection, string-built SQL and disabled
 # TLS. The own rules cover those (typescript + javascript, SCAN-132); Rust
-# (lattice, asset-library) is uncovered by this layer entirely.
+# (lattice, asset-library) is uncovered by this layer entirely. One own rule is
+# k8s YAML: a LoadBalancer Service that opens NodePorts (HLP-472).
 rules:
 - id: csharp_cookies_rule-CookieWithoutHttpOnlyFlag
   languages:
@@ -7566,3 +7567,33 @@ rules:
   - metavariable-regex:
       metavariable: $X
       regex: '^(?!`[^`$]*`$)'
+- id: lukejv_k8s_lb_rule-loadbalancer-allocates-nodeports
+  languages:
+  - yaml
+  severity: ERROR
+  message: |
+    LoadBalancer Service opens a NodePort on every node (HLP-442).
+    It lacks `allocateLoadBalancerNodePorts: false`. MetalLB L2 never uses the
+    NodePort, and it is a second way in that a rule on the LB IP
+    (OPNsense, loadBalancerSourceRanges) misses. Set
+    `allocateLoadBalancerNodePorts: false` under `spec:`. Helm values and other
+    non-manifest YAML are not checked.
+  metadata:
+    category: security
+    shortDescription: LoadBalancer Service opens NodePorts on every node
+    security-severity: High
+  patterns:
+  - pattern-inside: |
+      kind: Service
+      ...
+  - pattern-inside: |
+      spec:
+        ...
+        type: LoadBalancer
+        ...
+  - pattern-not-inside: |
+      spec:
+        ...
+        allocateLoadBalancerNodePorts: false
+        ...
+  - pattern: 'type: LoadBalancer'

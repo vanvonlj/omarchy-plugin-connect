@@ -1249,6 +1249,14 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
                 sys.stderr.write("scan-console: not reported — only whole-tree "
                                  "runs are (this was --diff/--history)\n")
             return
+        # `--only lessons` leaves nothing the console tracks: an empty-layers
+        # report would only become the target's latest scan, saying nothing
+        # was checked (gitops#253 F2).
+        if not any(l in CONSOLE_LAYERS for l in layers):
+            if not args.quiet:
+                sys.stderr.write("scan-console: not reported — no layer the "
+                                 "console tracks ran (lessons is not one)\n")
+            return
         u = urllib.parse.urlsplit(base)
         if u.scheme not in ("http", "https") or not u.hostname:
             warn("SCAN_CONSOLE_URL must be an http(s) URL; not reported")
@@ -1358,6 +1366,9 @@ def main():
                              "`scan --only lessons`, without --diff.\n")
             return 2
         layers = [l for l in layers if l != "lessons"]
+        if "lessons" in (args.only or []):   # asked for by name: say why not
+            sys.stderr.write("lessons: skipped — whole-tree only, never "
+                             "--diff or a pull_request run.\n")
 
     tools, missing = {}, {}
     for layer in layers:
