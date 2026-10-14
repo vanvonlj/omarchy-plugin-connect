@@ -822,9 +822,25 @@ def base_iac_counts(tools, root, diff_ref, touched):
     return counts
 
 
+# trivy 0.74.0 skips a chart it cannot render and a .tf it cannot parse, exits
+# 0, leaves no trace in the JSON, and `--quiet` hides the only line that says
+# so. file_path is root-relative. Unparseable YAML leaves no line at all, even
+# with --debug: trivy never detects it as config, so it cannot be named here.
+IAC_SKIP = re.compile(r'\[(helm scanner\] Skipping chart|terraform parser\] '
+                      r'Error parsing file)\b.*?\bfile_path="([^"]+)"')
+IAC_SKIP_WHY = {"h": "chart did not render", "t": "did not parse"}
+
+
+def iac_skips(stderr):
+    """[(path, reason)] for each file trivy skipped (SCAN-159), deduplicated:
+    the terraform line repeats once per module pass. A note, never a failure."""
+    return sorted({(m[2], IAC_SKIP_WHY[m[1][0]]) for m in IAC_SKIP.finditer(stderr)})
+
+
 def scan_iac(tools, root, out, diff_ref):
-    run([tools["trivy"], "config", str(root), "--severity", "HIGH,CRITICAL",
-         "--quiet", "--format", "json", "--output", str(out)])
+    # No --quiet: it hides the skip lines iac_skips() reads.
+    _, _, err = run([tools["trivy"], "config", str(root), "--severity",
+                     "HIGH,CRITICAL", "--format", "json", "--output", str(out)])
     doc = load_json(out)
     # In --diff mode the gate fails HARD on any new HIGH/CRITICAL. Without this
     # filter trivy rescans the whole tree every run, every pre-existing finding
@@ -854,7 +870,7 @@ def scan_iac(tools, root, out, diff_ref):
             findings.append(Finding(
                 "iac", (m.get("Severity") or "INFO").upper(),
                 rule, m.get("Title", ""), target))
-    return findings, None
+    return findings, None, iac_skips(err)
 
 
 SEMGREP_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
@@ -911,7 +927,8 @@ def report(findings, notes, layers, fmt, diff_ref, limit=20, partial=None):
             lines.append(f"**{notes[layer]}**" if md else f"!! {notes[layer]}")
         gaps = (partial or {}).get(layer) or []
         if gaps:
-            head = (f"{len(gaps)} manifest(s) not checked:" if notes.get(layer)
+            head = (f"{len(gaps)} file(s) not checked:" if layer == "iac"
+                    else f"{len(gaps)} manifest(s) not checked:" if notes.get(layer)
                     else f"{len(gaps)} manifest(s) not fully checked — partial "
                          "coverage, not a failure:")
             lines.append(f"{head}\n" if md else f"?? {head}")
@@ -1434,7 +1451,7 @@ def main():
             # the console as `notes` (SCAN-147), which change no coverage.
             partial["deps"] = uncovered_manifests(root)
         if "iac" in layers:
-            f, n = scan_iac(tools, root, out, diff_ref)
+            f, n, partial["iac"] = scan_iac(tools, root, out, diff_ref)
             findings += f
             notes["iac"] = n
         if "sast" in layers:
