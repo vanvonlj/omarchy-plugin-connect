@@ -637,7 +637,9 @@ def uncovered_manifests(root):
     is a note, never a failure and never a coverage change: see build_payload.
 
     Enumerated with `git ls-files` (tracked, plus untracked-not-ignored), so
-    .gitignore holds as it does for the scan; no repo, no list. A lockfile in
+    .gitignore holds as it does for the scan. None when the listing fails
+    (SCAN-161): "didn't say", never [] — that claims "checked, nothing to
+    note". A lockfile in
     an ancestor directory covers a nested package only when that ancestor
     declares a workspace (npm/yarn `workspaces`, pnpm-workspace.yaml,
     `[tool.uv.workspace]`): a root lockfile does not cover an unrelated
@@ -647,7 +649,7 @@ def uncovered_manifests(root):
     rc, so, _ = run(["git", "-C", str(root), "ls-files", "-z", "-c", "-o",
                      "--exclude-standard"])
     if rc != 0:
-        return []
+        return None
     files = {PurePosixPath(p) for p in so.split("\0")
              if p and "node_modules" not in PurePosixPath(p).parts
              and (root / p).is_file()}
@@ -1449,7 +1451,18 @@ def main():
             notes["deps"] = n
             # Its own channel, never notes: a note turns the layer off. Sent to
             # the console as `notes` (SCAN-147), which change no coverage.
-            partial["deps"] = uncovered_manifests(root)
+            # The catch covers the listing only; scan_deps above stays
+            # unguarded. Either failure leaves `partial` without deps, so the
+            # console reads "didn't say", and the scan still reaches its gate.
+            try:
+                m, why = uncovered_manifests(root), "git ls-files failed"
+            except Exception as e:
+                m, why = None, redact(f"{type(e).__name__}: {e}")
+            if m is None:
+                sys.stderr.write(f"warning: deps: could not list manifests "
+                                 f"({why}); no partial-coverage note sent\n")
+            else:
+                partial["deps"] = m
         if "iac" in layers:
             f, n, partial["iac"] = scan_iac(tools, root, out, diff_ref)
             findings += f
