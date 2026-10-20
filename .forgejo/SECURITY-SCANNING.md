@@ -95,7 +95,8 @@ yourself as well. The scanner is a floor, not a ceiling.
 |---|---|
 | `.betterleaks.toml` | secrets (gitleaks-compatible) |
 | `.osv-scanner.toml` | dependencies |
-| `.trivyignore` | IaC misconfiguration |
+| `.trivyignore` | IaC misconfiguration, check ID repo-wide |
+| `.trivyignore.yaml` | IaC misconfiguration, check ID + paths (instead of `.trivyignore`, never both) |
 | `.semgrepignore` | SAST |
 
 Every allowlist entry is a permanent hole in the scan. Record **why**, and never

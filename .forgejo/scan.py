@@ -783,6 +783,33 @@ def touched_paths(root, diff_ref):
     return paths
 
 
+def trivy_config(tools, target, root, *flags):
+    """`trivy config <target> <flags>`, plus the repo's .trivyignore.yaml (SCAN-184).
+
+    The yaml form can name a check AND a path (`.trivyignore` is IDs for the
+    whole repo). `--ignorefile` REPLACES `.trivyignore`, so a repo carries one or
+    the other; both is an error, not a silent drop of the older file's entries.
+    No yaml: the command is exactly what it was. trivy exits 1 with no output on
+    a malformed ignore file and run() never raises, which would read as a clean
+    scan, so with a yaml a non-zero exit stops the run.
+    """
+    yml, plain = Path(root) / ".trivyignore.yaml", Path(root) / ".trivyignore"
+    ignore = []
+    if yml.is_file():
+        if plain.is_file():
+            sys.stderr.write(f"error: {root} has both .trivyignore and .trivyignore.yaml; "
+                             "trivy reads only one. Move the .trivyignore IDs into the yaml "
+                             "(`misconfigurations:` list) and delete .trivyignore.\n")
+            sys.exit(2)
+        ignore = ["--ignorefile", str(yml)]
+    rc, so, err = run([tools["trivy"], "config", str(target), *flags, *ignore])
+    if ignore and rc != 0:
+        sys.stderr.write(f"error: trivy failed with {yml} (exit {rc}); the IaC scan did NOT "
+                         f"run:\n{err.strip()[-600:]}\n")
+        sys.exit(2)
+    return rc, so, err
+
+
 def base_iac_counts(tools, root, diff_ref, touched):
     """{(target, rule): count} for the BASE version of each touched file.
 
@@ -817,8 +844,8 @@ def base_iac_counts(tools, root, diff_ref, touched):
         if not wrote:
             return {}
         out = tmp / "_base.json"
-        run([tools["trivy"], "config", str(tmp), "--severity", "HIGH,CRITICAL",
-             "--quiet", "--format", "json", "--output", str(out)])
+        trivy_config(tools, tmp, root, "--severity", "HIGH,CRITICAL",
+                     "--quiet", "--format", "json", "--output", str(out))
         doc = load_json(out)
         for r in lst(doc, "Results"):
             # Key by ABSOLUTE repo path, not by trivy's Target.
@@ -863,8 +890,8 @@ def iac_skips(stderr):
 
 def scan_iac(tools, root, out, diff_ref):
     # No --quiet: it hides the skip lines iac_skips() reads.
-    _, _, err = run([tools["trivy"], "config", str(root), "--severity",
-                     "HIGH,CRITICAL", "--format", "json", "--output", str(out)])
+    _, _, err = trivy_config(tools, root, root, "--severity",
+                             "HIGH,CRITICAL", "--format", "json", "--output", str(out))
     doc = load_json(out)
     # In --diff mode the gate fails HARD on any new HIGH/CRITICAL. Without this
     # filter trivy rescans the whole tree every run, every pre-existing finding
