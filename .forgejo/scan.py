@@ -487,7 +487,7 @@ def fixed_version(pkg, ids, vulns):
         if v.get("id") not in ids:
             continue
         fixes = [e["fixed"]
-                 for a in lst(v, "affected")
+                 for a in lst(v, "affected") if isinstance(a, dict)
                  if (a.get("package") or {}).get("name") == name
                  for r in lst(a, "ranges") if r.get("type") != "GIT"
                  for e in lst(r, "events")
@@ -514,6 +514,20 @@ def advisory_id(ids):
 OSV_LABEL = {"CRITICAL": "CRITICAL", "HIGH": "HIGH", "MODERATE": "MEDIUM",
              "MEDIUM": "MEDIUM", "LOW": "LOW", "NEGLIGIBLE": "LOW"}
 # Ubuntu's "untriaged"/"unknown" are not ratings: they stay unscored, so HIGH.
+
+
+RUSTSEC_NOTES = {"unmaintained", "unsound", "notice"}
+
+
+def rustsec_note(ids, vulns):
+    """The RustSec `informational` kind (unmaintained, unsound, notice) of an
+    advisory in the group, or None. Anything else, or a malformed entry, is
+    None, so the group stays HIGH unscored (SCAN-176)."""
+    return next((n for v in vulns if v.get("id") in ids
+                 for a in lst(v, "affected") if isinstance(a, dict)
+                 for d in [a.get("database_specific")] if isinstance(d, dict)
+                 for n in [d.get("informational")]
+                 if isinstance(n, str) and n in RUSTSEC_NOTES), None)
 
 
 def advisory_label(ids, vulns):
@@ -560,10 +574,16 @@ def osv_source_scan(tools, root, out, extra=()):
                 except ValueError:
                     # No CVSS (the Go database scores nothing): the advisory's
                     # own label if it has one, else HIGH (SCAN-144) — never
-                    # LOW, which would hide it from every channel.
-                    label = advisory_label(ids, lst(p, "vulnerabilities"))
-                    sev = label or "HIGH"
-                    rating = f"rated {label}" if label else "unscored"
+                    # LOW, which would hide it from every channel. A RustSec
+                    # `informational` notice (unmaintained, unsound) is not a
+                    # vulnerability: MEDIUM keeps it visible, off the digest
+                    # (SCAN-176).
+                    vulns = lst(p, "vulnerabilities")
+                    label = advisory_label(ids, vulns)
+                    note = rustsec_note(ids, vulns)
+                    sev = label or ("MEDIUM" if note else "HIGH")
+                    rating = (f"rated {label}" if label else
+                              f"informational: {note}" if note else "unscored")
                 fix = fixed_version(info, ids, lst(p, "vulnerabilities"))
                 findings.append(Finding(
                     "deps", sev, advisory_id(ids),
