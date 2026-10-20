@@ -784,13 +784,15 @@ def base_iac_counts(tools, root, diff_ref, touched):
                 rel_to_top = abs_path.relative_to(top)
             except ValueError:
                 continue
+            # Bytes, not text: a committed file need not be UTF-8 (a Latin-1
+            # comment in a Dockerfile), and trivy must see it as committed.
             rc, blob, _ = run(["git", "-C", str(root), "show",
-                               f"{diff_ref}:{rel_to_top.as_posix()}"])
+                               f"{diff_ref}:{rel_to_top.as_posix()}"], text=False)
             if rc != 0:          # added by this change: no base, all findings new
                 continue
             dst = tmp / rel_to_top
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(blob)
+            dst.write_bytes(blob or b"")   # run() maps an empty b"" to ""
             wrote = True
         if not wrote:
             return {}
