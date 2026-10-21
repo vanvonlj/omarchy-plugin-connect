@@ -19,7 +19,7 @@
 # `lukejv_*`) are our own, written from scratch for this file — MIT, copyright
 # lukejv-dev. Never copy one in from semgrep-rules (below) or from
 # opengrep/opengrep-rules (archived, stale). Each has a positive and a negative
-# fixture in ops/forgejo-ci/tests/sast-js/, checked by test_sast_rules.py.
+# fixture in ops/forgejo-ci/tests/sast-js/ (or sast-bash/), checked by test_sast_rules.py.
 #
 # NOT semgrep's own `semgrep-rules` repo, and never vendor that one: it ships
 # under the Semgrep Rules License v1.0, which forbids redistribution outright.
@@ -33,11 +33,12 @@
 #   key, dropping duplicate ids, then append EVERYTHING below the
 #   `lukejv-dev rules` marker unchanged — it is not upstream and a regenerate
 #   that drops it silently blinds the TypeScript/JavaScript layer again.
-#   141 rules: 128 upstream (16 of them mode: taint) + 13 own.
+#   147 rules: 128 upstream (16 of them mode: taint) + 19 own.
 #
 # Coverage gap worth knowing: upstream has NO rust and NO typescript rules, and
 # its 11 javascript ones miss command injection, string-built SQL and disabled
-# TLS. The own rules cover those (typescript + javascript, SCAN-132); Rust
+# TLS. The own rules cover those (typescript + javascript, SCAN-132); six more cover
+# bash (SCAN-134: eval, piped installers, rm -rf, chmod, curl -k, secrets on a command line); Rust
 # (lattice, asset-library) is uncovered by this layer entirely. One own rule is
 # k8s YAML: a LoadBalancer Service that opens NodePorts (HLP-472).
 rules:
@@ -7597,3 +7598,151 @@ rules:
         allocateLoadBalancerNodePorts: false
         ...
   - pattern: 'type: LoadBalancer'
+# bash (SCAN-134). opengrep only picks a file up as bash by its `.sh` extension:
+# an extensionless script with a `#!/bin/bash` line is NOT scanned.
+- id: lukejv_sh_eval_rule-eval-expansion
+  languages:
+  - bash
+  severity: ERROR
+  message: |
+    `eval` runs the text it is given as shell code, and this argument contains an expansion
+    ($var, $(...) or backticks). Whatever that expands to (a filename, an env var, a command's
+    output) is executed, so `x='a; rm -rf ~'` runs the `rm`.
+    Drop the eval: use an array (`cmd=(git log "$ref"); "${cmd[@]}"`), `printf -v`, or `declare -n`.
+    A fixed-tool bootstrap such as `eval "$(ssh-agent -s)"` is the usual exception; say so with a `# nosemgrep` comment.
+  metadata:
+    cwe: CWE-95
+    category: security
+    shortDescription: Code injection via eval of an expansion
+    security-severity: High
+  patterns:
+  - pattern: eval ...
+  # Single-quoted text is the one literal form: the $ in it is only expanded by the eval
+  # itself, from text the author wrote.
+  # The regex starts AT `eval`: opengrep keeps a regex hit only when it lies inside the
+  # command node, and a regex that began at the line start would miss every indented eval.
+  - pattern-regex: (?<![\w.-])eval\s+(?!'[^']*'\s*(?:[;&|)]|$))[^#\n]*[$`]
+- id: lukejv_sh_pipe_rule-curl-pipe-shell
+  languages:
+  - bash
+  severity: ERROR
+  message: |
+    A download is piped straight into a shell (or `sh -c "$(curl …)"`, or `bash <(curl …)`), so
+    whatever the server returns at that moment runs, as this script's user, with nothing checked first.
+    A truncated download also runs half a script. Download to a file, verify it (`sha256sum -c`,
+    `gpg --verify`), then run it.
+  metadata:
+    cwe: CWE-494
+    category: security
+    shortDescription: Remote script piped into a shell
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: curl ... | $SH ...
+    - pattern: wget ... | $SH ...
+    - pattern: curl ... | sudo $SH ...
+    - pattern: wget ... | sudo $SH ...
+    - pattern: curl ... | sudo -E $SH ...
+    - pattern: wget ... | sudo -E $SH ...
+    - pattern: curl ... | sudo -- $SH ...
+    - pattern: wget ... | sudo -- $SH ...
+    - pattern: curl ... | env $SH ...
+    - pattern: wget ... | env $SH ...
+    - pattern: $SH <(curl ...)
+    - pattern: $SH <(wget ...)
+    - pattern: $SH -c "$(curl ...)"
+    - pattern: $SH -c "$(wget ...)"
+  - metavariable-regex:
+      metavariable: $SH
+      # An optional path prefix (`/bin/bash`); `source` and `.` run a process substitution too.
+      regex: ^(?:(?:.*/)?(?:sh|bash|zsh|dash|ash)|source|\.)$
+- id: lukejv_sh_rm_rule-rm-rf-unguarded-variable
+  languages:
+  - bash
+  severity: ERROR
+  message: |
+    `rm -r` is aimed at a path that starts with a variable that is not guarded. If the variable is
+    empty or unset, `rm -rf $DIR/` and `rm -rf "$DIR"/*` become `rm -rf /` and `rm -rf /*`; an
+    unquoted `$DIR` that holds a space deletes both halves.
+    Guard it, so the script stops instead: `rm -rf -- "${DIR:?}"/*`, and quote every expansion.
+  metadata:
+    cwe: CWE-73
+    category: security
+    shortDescription: Recursive delete of an unguarded variable path
+    security-severity: High
+  patterns:
+  - pattern: rm ...
+  # An -r flag, then either an unquoted $var/$(…) as the path, or a quoted "$var" directly
+  # followed by `/` (an empty var turns that into `/…`). `${VAR:?}` is the guard.
+  - pattern-regex: >-
+      (?<![\w.-])rm\s+(?:-\S+\s+)*?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)\s+(?:-\S+\s+)*(?:--\s+)?(?:\$(?!\{[^}]*:\?)|"\$(?:\w+|\{\w+\})"?/)
+- id: lukejv_sh_chmod_rule-world-writable-or-setuid
+  languages:
+  - bash
+  severity: WARNING
+  message: |
+    This chmod makes a file world-writable (777, 666, o+w) or sets the setuid/setgid bit (+s, 4755),
+    so any local user can replace the file or run it with its owner's rights. Grant what is needed:
+    `chmod 755` for a program, `chmod 750` plus `chgrp` for a shared one, and no setuid on scripts.
+  metadata:
+    cwe: CWE-732
+    category: security
+    shortDescription: World-writable or setuid permissions
+    security-severity: Medium
+  patterns:
+  - pattern: chmod ... $MODE ...
+  - metavariable-regex:
+      metavariable: $MODE
+      # Octal: world-writable (last digit 2,3,6,7) or setuid/setgid (leading digit 2-7 of four).
+      # Symbolic: `s` for anyone, `w` only when the class holds o or a (`u+w` is fine); a comma list
+      # is checked clause by clause.
+      regex: ^(?:[0-7]?[0-7][0-7][2367]|[2-7][0-7]{3}|(?:[^,]*,)*(?:[ugoa]*[+=][rwxXt]*s[rwxXst]*|[ugoa]*[oa][ugoa]*[+=][rwxXst]*w[rwxXst]*)(?:,.*)?)$
+- id: lukejv_sh_tls_rule-curl-wget-no-verify
+  languages:
+  - bash
+  severity: ERROR
+  message: |
+    `curl -k` / `--insecure` and `wget --no-check-certificate` turn off certificate verification, so
+    anyone on the path can impersonate the server and feed this script anything.
+    Trust the right CA instead: `curl --cacert ca.pem …` or `wget --ca-certificate=ca.pem …`.
+  metadata:
+    cwe: CWE-295
+    category: security
+    shortDescription: TLS certificate verification disabled
+    security-severity: High
+  patterns:
+  # Two branches, because the flags differ: `-k` (also inside a bundle, `-fsSLk`) is curl's
+  # --insecure, but wget's `-k` converts links (`wget -rkp`), so wget only has the long flag.
+  - pattern-either:
+    - patterns:
+      - pattern: curl ... $FLAG ...
+      - metavariable-regex:
+          metavariable: $FLAG
+          regex: ^(?:--insecure|-[A-Za-z]*k[A-Za-z]*)$
+    - patterns:
+      - pattern: wget ... $FLAG ...
+      - metavariable-regex:
+          metavariable: $FLAG
+          regex: ^--no-check-certificate$
+- id: lukejv_sh_secret_rule-secret-on-command-line
+  languages:
+  - bash
+  severity: WARNING
+  message: |
+    A secret goes on a command line (`--password "$PW"`, `mysql -p"$PW"`) or is echoed to stdout.
+    Command lines are readable by every local user in `ps` and /proc, and stdout lands in CI
+    and journal logs. Pass it on stdin (`--password-stdin`), through an env var the tool reads
+    itself, or from a file with mode 600.
+  metadata:
+    cwe: CWE-214
+    category: security
+    shortDescription: Secret on a command line or echoed
+    security-severity: Medium
+  patterns:
+  - pattern: $CMD ...
+  # Each alternative starts at the thing itself (the option, `mysql`, `echo`), so it also
+  # fires inside a quoted remote command (`ssh host "mysql -p'$PW' …"`). A secret echoed into a
+  # pipe or a file (`echo "$PW" | docker login --password-stdin`) is the safe idiom, not a hit;
+  # the variable's NAME must end in the secret word, so `$VAULT_PASSWORD_FILE` is not one.
+  - pattern-regex: >-
+      (?i)(?:--(?:password|passwd|token|secret|api-?key|client-secret)(?:=|\s+)["']?\$|\bmysql(?:dump)?\b[^#\n]*?\s-p["']?\$|\b(?:echo|printf)[ \t]+[^#\n|>]*?\$\{?\w*?(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_KEY)\}?(?!\w)(?![^\n]*[|>]))
