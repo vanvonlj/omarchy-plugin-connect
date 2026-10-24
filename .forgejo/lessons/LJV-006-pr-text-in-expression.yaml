@@ -1,0 +1,45 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-006 — a PR/issue/comment-controlled text field inside `${{ }}` in a
+# workflow (CNVYR-446, from 2026-10-21: act failed on assistant#204 with
+# `unable to interpolate variable "PR_BODY"`, i.e. it re-evaluates `${{ … }}`
+# found inside the value, so a crafted title can expand `secrets.*` in a job
+# that holds them). Regex, not a YAML pattern: the expression is just as
+# dangerous in `env:`, `run:`, `with:` or `if:`.
+# Only `}}` ends the expression, so `format('{0}', …title)` is caught.
+# Dot and bracket syntax both match, mixed too: github.event['pull_request'].title.
+# Covers the PR/issue/comment/review/discussion title, body, labels, head.ref,
+# head.label and head.repo.*; head_ref and ref_name; head_commit and
+# workflow_run.head_commit message/author/committer; workflow_run
+# head_branch, display_title and head_repository; event.commits.
+# Not covered: a whole object (toJSON(github.event.pull_request), toJSON(github.event)),
+# github.ref (refs/heads/<name>), workflow_run.pull_requests.*, release and
+# discussion-category fields, and `inputs.*` from workflow_dispatch/call.
+rules:
+- id: LJV-006
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    PR-controlled text (title, body, head ref, label, commit message) passed through `${{ }}` in a workflow.
+
+    The runner substitutes the text before the step runs, and Forgejo's runner
+    (act) re-evaluates `${{ }}` found inside it, so a PR title like
+    `${{ secrets.X }}` reaches the job's secrets; in `run:` it is also shell
+    injection. Fix: read the field from `$GITHUB_EVENT_PATH` inside the step
+    (jq or the script's own JSON parser). SHAs and numbers are fine.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-006-pr-text-in-a-workflow-expression
+  metadata:
+    lesson: LJV-006
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-006-pr-text-in-a-workflow-expression
+  pattern-regex: |-
+    (?ix)
+    \$\{\{ (?:(?!\}\})[\s\S])*?
+    \bgithub (?: [.\[\]'"\s]+ (?:head_ref|ref_name)\b
+               | [.\[\]'"\s]+ event [.\[\]'"\s]+ (?:
+                   (?:pull_request|issue|comment|review|review_comment|discussion) [.\[\]'"\s]+ (?:
+                       (?:title|body|labels?)\b
+                     | head [.\[\]'"\s]+ (?:ref|label|repo)\b )
+                 | (?:head_commit|workflow_run [.\[\]'"\s]+ head_commit) [.\[\]'"\s]+ (?:message|author|committer)\b
+                 | workflow_run [.\[\]'"\s]+ (?:head_branch|display_title|head_repository)\b
+                 | commits\b ) )

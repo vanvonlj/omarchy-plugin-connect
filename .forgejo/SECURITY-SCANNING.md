@@ -24,7 +24,8 @@ when the first pass finds no lockfile.
 
 `lessons` is our own anti-pattern rules, `LJV-NNN` (e.g. LJV-001, non-secret
 data in a k8s Secret): a backlog, not a PR gate. They run in a whole-tree
-`scan` only, never in `--diff` or a PR's CI. Each finding's message says the fix
+`scan` only, never in a PR's CI and not in `--diff`, except a rule marked
+`in_diff: true` (LJV-005). Each finding's message says the fix
 and links its entry on https://docs.lukejv.com/architecture/anti-patterns/.
 
 If `scan` is not on PATH, `python3 .forgejo/scan.py --diff` is identical — the
@@ -94,7 +95,7 @@ yourself as well. The scanner is a floor, not a ceiling.
 | file | tool |
 |---|---|
 | `.betterleaks.toml` | secrets (gitleaks-compatible) |
-| `.osv-scanner.toml` | dependencies |
+| `osv-scanner.toml` (no leading dot; osv-scanner ignores `.osv-scanner.toml`) | dependencies |
 | `.trivyignore` | IaC misconfiguration, check ID repo-wide |
 | `.trivyignore.yaml` | IaC misconfiguration, check ID + paths (instead of `.trivyignore`, never both) |
 | `.semgrepignore` | SAST |

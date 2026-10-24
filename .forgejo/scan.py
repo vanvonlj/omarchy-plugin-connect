@@ -57,8 +57,11 @@ WHAT EACH LAYER ACTUALLY COVERS — read this before trusting a clean result:
   lessons  opengrep again, against our own rules in lessons/ — one file per
            anti-pattern we learned the hard way (LJV-NNN, SCAN-153). Each rule
            ships with a .fixture the canary runs every time. Whole-tree only:
-           never in --diff or a pull_request CI run, because a lesson is a
-           backlog to work through, not a PR gate. See canary_lessons().
+           never in a pull_request CI run, and not in --diff either, because
+           a lesson is a backlog to work through, not a PR gate. See
+           canary_lessons(). One exception: a rule whose metadata says
+           `in_diff: true` also runs in --diff (new findings only), for a
+           lesson that is about what THIS change introduced (LJV-005).
 
 EVERY TOOL HERE FAILS OPEN. opengrep with no rules, osv-scanner with no network,
 trivy with no checks bundle and betterleaks with a stale binary all exit 0 and
@@ -596,6 +599,22 @@ def osv_source_scan(tools, root, out, extra=()):
     return findings, sources
 
 
+def misnamed_osv_configs(root):
+    """Paths of `.osv-scanner.toml` files under root (SCAN-264).
+
+    osv-scanner reads only `osv-scanner.toml`; a dotted file is silently ignored,
+    so the suppression it was written for never applies. ponytail: a plain walk
+    that skips .git and node_modules, not gitignore-aware; swap for
+    `git ls-files -co` if a vendored tree ever makes that noisy.
+    """
+    found = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in (".git", "node_modules")]
+        if ".osv-scanner.toml" in files:
+            found.append(rel(Path(d) / ".osv-scanner.toml", root))
+    return sorted(found)
+
+
 def scan_deps(tools, root, out):
     """Dependency CVEs.
 
@@ -640,6 +659,23 @@ def scan_deps(tools, root, out):
 NPM_LOCKS = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
              "pnpm-lock.yaml", "bun.lock"}
 PY_LOCKS = {"poetry.lock", "uv.lock", "Pipfile.lock", "pdm.lock", "pylock.toml"}
+# Manifests osv-scanner cannot read without their lockfile (go.mod, pom.xml it reads itself).
+OTHER_LOCKS = {"Cargo.toml": "Cargo.lock", "Gemfile": "Gemfile.lock",
+               "composer.json": "composer.lock"}
+NOTHING_TO_CHECK = "deps: nothing to check (no package manifests)"
+# SCAN-271: every file name that means "this tree has dependencies", for any
+# ecosystem osv-scanner or we know. "Nothing to check" holds only when the tree
+# has NONE of them (and no submodule); one that osv-scanner found no lockfile
+# for is a real gap and fails. Add an ecosystem here, not to OTHER_LOCKS: that
+# one is only the manifests the partial-coverage note can pair with a lockfile.
+MANIFEST_NAMES = (
+    {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile",
+     "packages.config", "Directory.Packages.props", "go.mod", "pom.xml",
+     "build.gradle", "build.gradle.kts", "mix.exs", "pubspec.yaml", "vcpkg.json",
+     "conanfile.txt", "conanfile.py", "Package.swift", "deno.json", "deno.jsonc",
+     "build.sbt", "Podfile", "gradle.lockfile", "go.sum", "Package.resolved"}
+    | OTHER_LOCKS.keys() | set(OTHER_LOCKS.values()) | NPM_LOCKS | PY_LOCKS)
+MANIFEST_SUFFIXES = (".csproj", ".fsproj", ".vbproj", ".gemspec")
 NPM_DEP_KEYS = ("dependencies", "devDependencies", "optionalDependencies",
                 "peerDependencies")
 # MSBuild files above a .csproj that can add PackageReferences to it.
@@ -662,7 +698,7 @@ def uncovered_manifests(root):
     note". A lockfile in
     an ancestor directory covers a nested package only when that ancestor
     declares a workspace (npm/yarn `workspaces`, pnpm-workspace.yaml,
-    `[tool.uv.workspace]`): a root lockfile does not cover an unrelated
+    `[tool.uv.workspace]`, Cargo `[workspace]`): a root lockfile does not cover an unrelated
     sub-project. node_modules never counts. A package.json or .csproj that
     declares no dependency has nothing to lock and is not listed (SCAN-156).
     Paths are root-relative; report() redacts them."""
@@ -695,6 +731,8 @@ def uncovered_manifests(root):
                     return True
             except (ValueError, TypeError):
                 pass
+        if "Cargo.toml" in here and "[workspace]" in (read(a / "Cargo.toml") or ""):
+            return True
         return ("pyproject.toml" in here
                 and "[tool.uv.workspace]" in (read(a / "pyproject.toml") or ""))
 
@@ -729,6 +767,8 @@ def uncovered_manifests(root):
         elif (n.endswith(".csproj") and "packages.lock.json" not in names[d]
               and declares_deps(f)):
             gaps.append((str(f), "direct dependencies only"))
+        elif n in OTHER_LOCKS and not locked(d, {OTHER_LOCKS[n]}):
+            gaps.append((str(f), "no lockfile"))
         elif n.startswith("requirements") and n.endswith(".txt"):
             text = read(f)
             if text is None:   # a note must never crash the scan before its gate
@@ -743,6 +783,31 @@ def uncovered_manifests(root):
             if loose:
                 gaps.append((str(f), f"not pinned ({loose} line{'s' * (loose > 1)})"))
     return gaps
+
+
+def has_manifest(root):
+    """True unless the tree provably holds no dependency manifest (SCAN-271).
+
+    Any name in MANIFEST_NAMES (or requirements*.txt, *.csproj and kin) counts,
+    at any depth, hidden dirs included; only a top-level `vendor/` and
+    node_modules are skipped. A git submodule is a gitlink that is_file() drops,
+    so its presence, like a failed listing, answers True: unknown is not empty.
+    """
+    rc, so, _ = run(["git", "-C", str(root), "ls-files", "-z", "-s", "-c", "-o",
+                     "--exclude-standard"])
+    if rc != 0:
+        return True
+    for ent in so.split("\0"):
+        if ent.startswith("160000 "):
+            return True
+        parts = PurePosixPath(ent.split("\t", 1)[-1]).parts
+        if not parts or parts[0] == "vendor" or "node_modules" in parts:
+            continue
+        n = parts[-1]
+        if (n in MANIFEST_NAMES or n.endswith(MANIFEST_SUFFIXES)
+                or (n.startswith("requirements") and n.endswith(".txt"))):
+            return True
+    return False
 
 
 def touched_paths(root, diff_ref):
@@ -927,18 +992,105 @@ def scan_iac(tools, root, out, diff_ref):
 SEMGREP_SEV = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
 
 
+# LJV-005's cross-file half (opengrep sees one file at a time). A Secret counts
+# as created when its name appears in any manifest that makes Secrets: a Secret,
+# SealedSecret, InfisicalStaticSecret/InfisicalSecret, ExternalSecret, a
+# cert-manager Certificate (spec.secretName), a kustomize secretGenerator, or a
+# `.yaml.example` template. ponytail: any `name:`/`secretName:` in such a file
+# and no namespace match, so it errs quiet; parse the kinds if that proves too loose.
+CREATES_SECRET = re.compile(
+    r"^kind:[ \t]*[\"']?(Secret|SealedSecret|InfisicalStaticSecret|InfisicalSecret|"
+    r"ExternalSecret|Certificate)\b|^secretGenerator:", re.M)
+SECRET_NAME = re.compile(r"\b(?:name|secretName):[ \t]*[\"']?([a-z0-9][a-z0-9.-]*)")
+SKIP_DIRS = {".git", "node_modules"}
+
+
+# Kinds that fill a Secret from OUTSIDE the repo (the values live in Infisical or
+# a vault): declaring one in a change does not mean the values exist yet.
+SYNCED_KINDS = {"InfisicalStaticSecret", "InfisicalSecret", "ExternalSecret"}
+KIND = re.compile(r"^kind:[ \t]*[\"']?(\w+)", re.M)
+
+
+def created_secrets(root):
+    """{secret name: [(path, synced_only)]}: every manifest that makes it.
+    synced_only is True when the file's only Secret-making kinds are SYNCED_KINDS."""
+    names = {}
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            if not f.endswith((".yaml", ".yml", ".example")):
+                continue
+            try:
+                text = (Path(dirpath) / f).read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if CREATES_SECRET.search(text):
+                kinds = set(KIND.findall(text))
+                synced = (not f.endswith(".example") and "secretGenerator:" not in text
+                          and kinds & SYNCED_KINDS
+                          and not kinds & {"Secret", "SealedSecret", "Certificate"})
+                for n in SECRET_NAME.findall(text):
+                    names.setdefault(n, []).append((Path(dirpath) / f, bool(synced)))
+    return names
+
+
+def new_in_diff(root, diff_ref, path, name):
+    """True when `name` is not declared in `path` at diff_ref (file or name added
+    by this change). False when git cannot answer: err quiet, like everywhere."""
+    rc, top, _ = run(["git", "-C", str(root), "rev-parse", "--show-toplevel"])
+    if rc != 0 or not top.strip():
+        return False
+    try:
+        rel_path = Path(path).resolve().relative_to(Path(top.strip()).resolve())
+    except ValueError:
+        return False
+    rc, blob, err = run(["git", "-C", str(root), "show", f"{diff_ref}:{rel_path.as_posix()}"])
+    if rc != 0:
+        return "exists on disk, but not in" in err or "does not exist" in err
+    return not re.search(rf"\b{re.escape(name)}\b", blob)
+
+
+SYNCED_NEW = ("`{n}` is Infisical-synced by a resource added here: fill it before merge or "
+              "suspend the CronJob")
+SYNCED_NEW_WHY = ("The Secret is synced from Infisical by a resource added in this change: its values "
+                  "must exist before merge, or ship the CronJob `suspend: true`.")
+
+
+def diff_lessons():
+    """Lesson rule files that opt in to --diff with `in_diff: true`."""
+    return [p for p in sorted(LESSONS.glob("*.yaml"))
+            if re.search(r"^\s+in_diff:\s*true\b", p.read_text(), re.M)]
+
+
 def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
     # No --metrics flag: opengrep removed telemetry entirely and errors on it.
-    cmd = [tools["opengrep"], "scan", "--config", str(config),
+    cfgs = config if isinstance(config, (list, tuple)) else [config]
+    cmd = [tools["opengrep"], "scan", *[a for c in cfgs for a in ("--config", str(c))],
            "--taint-intrafile", "--quiet", "--json", "--output", str(out)]
     if diff_ref:
         cmd += ["--baseline-commit", diff_ref]
     cmd.append(str(root))
     run(cmd)
-    findings = []
+    findings, created = [], None
     for x in lst(load_json(out), "results"):
         extra = x.get("extra") or {}
         message = (extra.get("message") or "").strip()
+        if (x.get("check_id") or "").endswith("LJV-005"):
+            if created is None:
+                created = created_secrets(root)
+            name = ((extra.get("metavars") or {}).get("$NAME") or {}).get("abstract_content")
+            # A name that is not a plain literal ($(..), {{..}}) can't be judged.
+            if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", name or ""):
+                continue
+            makers = created.get(name)
+            if makers:
+                # --diff only (no history in a whole-tree scan): the Secret exists
+                # as a manifest, but if every maker is an external sync that this
+                # change added, its VALUES may not exist yet (SCAN-209).
+                if not (diff_ref and all(sy and new_in_diff(root, diff_ref, p, name)
+                                         for p, sy in makers)):
+                    continue
+                message = SYNCED_NEW.format(n=name) + "\n\n" + SYNCED_NEW_WHY + "\n\n" + message
         findings.append(Finding(
             layer, SEMGREP_SEV.get(extra.get("severity"), "LOW"),
             (x.get("check_id") or "?").split(".")[-1],
@@ -1392,7 +1544,8 @@ def main():
     ap.add_argument("--diff", nargs="?", const="origin/main", metavar="REF",
                     help="only what changed since REF (default origin/main). "
                          "Applies to secrets, SAST and IaC; deps is "
-                         "whole-tree either way, and lessons never runs.")
+                         "whole-tree either way, and lessons runs only the rules "
+                         "marked `in_diff: true`.")
     ap.add_argument("--history", action="store_true",
                     help="secrets: scan all git history, not the working tree")
     ap.add_argument("--only", action="append", choices=LAYERS, default=[],
@@ -1428,15 +1581,19 @@ def main():
     # Lessons are a backlog for a whole-tree `scan`, not a PR gate (Lucas,
     # SCAN-153): no --diff run and no pull_request CI run ever shows them.
     in_pr = os.environ.get("GITHUB_EVENT_NAME", "").startswith("pull_request")
+    # Exception: rules marked `in_diff: true` run in --diff, new findings only.
+    lesson_cfg = LESSONS
     if "lessons" in layers and (args.diff or in_pr):
-        if args.only == ["lessons"]:
-            sys.stderr.write("error: lessons runs whole-tree only: "
-                             "`scan --only lessons`, without --diff.\n")
-            return 2
-        layers = [l for l in layers if l != "lessons"]
-        if "lessons" in (args.only or []):   # asked for by name: say why not
-            sys.stderr.write("lessons: skipped — whole-tree only, never "
-                             "--diff or a pull_request run.\n")
+        lesson_cfg = diff_lessons() if args.diff else []
+        if not lesson_cfg:
+            if args.only == ["lessons"]:
+                sys.stderr.write("error: lessons runs whole-tree only: "
+                                 "`scan --only lessons`, without --diff.\n")
+                return 2
+            layers = [l for l in layers if l != "lessons"]
+            if "lessons" in (args.only or []):   # asked for by name: say why not
+                sys.stderr.write("lessons: skipped — whole-tree only, never "
+                                 "--diff or a pull_request run.\n")
 
     tools, missing = {}, {}
     for layer in layers:
@@ -1484,6 +1641,7 @@ def main():
         canary(tools, layers, args.quiet)
 
     findings, notes, broken, partial = [], {}, [], {}
+    nothing_to_check = False
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out.json"
         if "secrets" in layers:
@@ -1495,6 +1653,9 @@ def main():
             findings += f
             notes["secrets"] = n
         if "deps" in layers:
+            for p in misnamed_osv_configs(root):
+                sys.stderr.write(f"warning: deps: {p} is named .osv-scanner.toml, "
+                                 "osv-scanner ignores it; rename to osv-scanner.toml\n")
             f, n = scan_deps(tools, root, out)
             findings += f
             notes["deps"] = n
@@ -1512,6 +1673,12 @@ def main():
                                  f"({why}); no partial-coverage note sent\n")
             else:
                 partial["deps"] = m
+                # SCAN-271: no lockfile AND no manifest of any known kind
+                # (has_manifest) is "nothing to check", not "missed something".
+                # Only the gate and the printed note see it: the console still
+                # gets deps as NOT covered, or it resolves every open deps
+                # finding.
+                nothing_to_check = bool(n) and not has_manifest(root)
         if "iac" in layers:
             f, n, partial["iac"] = scan_iac(tools, root, out, diff_ref)
             findings += f
@@ -1521,11 +1688,14 @@ def main():
             findings += f
             notes["sast"] = n
         if "lessons" in layers:
-            f, n = scan_sast(tools, root, out, diff_ref, LESSONS, "lessons")
+            f, n = scan_sast(tools, root, out, diff_ref, lesson_cfg, "lessons")
             findings += f
             notes["lessons"] = n
 
-    print(report(findings, notes, layers, args.format, diff_ref, partial=partial))
+    shown = {**notes, "deps": None} if nothing_to_check else notes
+    print(report(findings, shown, layers, args.format, diff_ref, partial=partial))
+    if nothing_to_check:
+        print(f"\n{NOTHING_TO_CHECK}")
 
     # ---- the gate ---------------------------------------------------------
     # Whole-tree runs gate NARROWLY. Secrets are binary, so any hit fails.
@@ -1572,7 +1742,7 @@ def main():
     # checked nothing (CNVYR-156). --diff only, because whole-tree is CI, and
     # half the org has no lockfile at all — failing there turns those repos red
     # for a hole nobody can fix. --allow-uncovered accepts it on purpose.
-    uncovered = [k for k, v in notes.items() if v and k not in broken]
+    uncovered = [k for k, v in shown.items() if v and k not in broken]
     if diff_ref and uncovered and not args.allow_uncovered:
         reasons.append(f"{', '.join(uncovered)} covered nothing — uncovered, "
                        "not clean (--allow-uncovered to accept)")

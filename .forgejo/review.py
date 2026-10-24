@@ -49,8 +49,10 @@ I mean" — but do not expect one-click acceptance.
 TRUST. The diff is untrusted text: anyone who can open a PR can write
 "ignore your instructions" into it, and this process holds the Claude OAuth
 token. Hence --disallowed-tools on everything that reaches the network or writes
-to the tree, and hence the workflow runs THIS FILE FROM THE BASE REF, not from
-the PR's checkout. See the note in the workflow.
+to the tree, hence the workflow runs THIS FILE FROM THE BASE REF, not from
+the PR's checkout (see the note in the workflow), and hence claude itself runs
+outside the checkout, so the PR's hooks, MCP servers and CLAUDE.md never load
+(see ask_claude).
 """
 
 import base64
@@ -60,8 +62,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -117,10 +121,148 @@ def sh(*args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw).stdout
 
 
+def fetch(*refs):
+    """`git fetch` with the job token sent as a header for this one command
+    (CNVYR-451). The checkout keeps no credential, as claude can read it and a
+    prompt-injected PR could have it quote one. The header goes in through the
+    environment, not `-c` on argv, which any process can read. Same form as
+    actions/checkout's own.
+
+    Raises on a non-zero exit (CNVYR-456 F1): a failed fetch leaves the shas
+    unknown, `git diff` on them prints nothing, and an empty diff would post
+    "nothing to review" and a green status for a PR nobody read."""
+    auth = base64.b64encode(f"x-access-token:{os.environ.get('TOKEN', '')}".encode()).decode()
+    p = subprocess.run(["git", "fetch", "--no-tags", "origin", *refs],
+                       capture_output=True, text=True, env=dict(
+        os.environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+        GIT_CONFIG_VALUE_0=f"Authorization: basic {auth}"))
+    if p.returncode != 0:
+        raise RuntimeError(f"git fetch exited {p.returncode}: "
+                           + redact(p.stderr[-500:].strip())[0])
+
+
+# A URL's userinfo when it is a credential: a password (`user:pass@`), or any
+# userinfo on http(s), where a lone "user" is a token. `ssh://git@host` is not.
+USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s]+)@")
+
+
+def strip_userinfo(text):
+    """text with the credential cut out of every URL in it."""
+    return USERINFO.sub(lambda m: m.group(1) if ":" in m.group(2)
+                        or m.group(1).lower().startswith("http") else m.group(0), text)
+
+
+def scrub_credentials():
+    """Removes any credential from the checkout's .git/config, and fails if one
+    is left. claude can read the checkout (CNVYR-451); the workflow keeps the
+    token out of it, and this holds if a workflow or checkout does not. Covers
+    header and helper entries, insteadOf and pushInsteadOf rewrite rules, any
+    key whose name carries a credential, and a credential in any value
+    (a URL with a user and token before the host) (CNVYR-456 F2, F5)."""
+    # Resolve the real config path instead of assuming .git/config: a worktree
+    # or submodule checkout has .git as a FILE, so `git config --file
+    # .git/config` would error, sh() would swallow it, and the check below would
+    # pass vacuously on a config it never read (F5). rev-parse gives the path
+    # git itself would use, or nothing when this is not a repo — raise then.
+    conf = sh("git", "rev-parse", "--git-path", "config").strip()
+    if not conf or not os.path.isfile(conf):
+        raise RuntimeError(".git config is not a readable file")
+    keys = re.compile(r"^(http\.(.*\.)?extraheader|credential\..*|url\..*\.(push)?insteadof)$",
+                      re.I)
+
+    def entries():
+        # --null: a value may hold spaces or newlines; key and value split at
+        # the first newline, entries at NUL.
+        out = sh("git", "config", "--file", conf, "--null", "--list")
+        return [e.partition("\n")[::2] for e in out.split("\0") if e]
+
+    for k, v in entries():
+        # Logged without the credential: the job log is readable too.
+        if keys.match(k) or strip_userinfo(k) != k:
+            print(f"removing {strip_userinfo(k)} from {conf}")
+            sh("git", "config", "--file", conf, "--unset-all", k)
+        elif strip_userinfo(v) != v:
+            # The key (a remote, a proxy) must stay: rewrite just this value,
+            # matched literally, so a multi-valued key keeps its other values.
+            print(f"stripping credentials from {k} in {conf}")
+            sh("git", "config", "--file", conf, "--fixed-value", "--replace-all",
+               k, strip_userinfo(v), v)
+    left = sorted({strip_userinfo(k) for k, v in entries() if keys.match(k)
+                   or strip_userinfo(k) != k or strip_userinfo(v) != v})
+    if left:
+        raise RuntimeError(f"a credential is still in {conf}: {', '.join(left)}")
+
+
+PROXY_VARS = tuple(v for n in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
+                   for v in (n, n.lower()))
+
+
+def secret_values():
+    """The values of this process's secret env vars — the explicit three plus
+    any name matching the pattern — and the userinfo and password of a proxy
+    URL (F4), each >= 8 chars. Longest first, so a token that contains a
+    shorter secret is masked whole rather than in pieces."""
+    out = set()
+    for name, val in os.environ.items():
+        if name in PROXY_VARS:
+            for m in USERINFO.finditer(val):
+                out.update((m.group(2), m.group(2).partition(":")[2]))
+        elif (name in ("CLAUDE_CODE_OAUTH_TOKEN", "TOKEN", "ACTIONS_RUNTIME_TOKEN")
+              or re.search(r"TOKEN|SECRET|KEY|PASSWORD", name)):
+            out.add(val)
+    return sorted((v for v in out if len(v) >= 8), key=len, reverse=True)
+
+
+def redact(text):
+    """(text with every secret env value replaced by [redacted], count of the
+    values that matched). The reviewer holds the OAuth and job tokens, and a
+    prompt-injected diff could talk the model into quoting one into a finding;
+    nothing leaves this process with a secret value in it (CNVYR-456). Each
+    value's JSON-escaped and URL-encoded forms too (F3): the model can quote
+    one from inside a JSON blob or a URL as easily as bare."""
+    n = 0
+    for v in secret_values():
+        forms = {v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1],
+                 urllib.parse.quote(v, safe=""), urllib.parse.quote_plus(v)}
+        hit = False
+        for form in sorted(forms, key=len, reverse=True):
+            if form in text:
+                text, hit = text.replace(form, "[redacted]"), True
+        n += hit
+    return text, n
+
+
+def redact_all(obj):
+    """(obj with every string in it redacted, count). On the raw strings, not
+    the encoded body (F3): json.dumps escapes a quote, a backslash or any
+    non-ASCII char, and the escaped secret no longer matches the raw one."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, (list, tuple)):
+        pairs = [redact_all(x) for x in obj]
+        return [x for x, _ in pairs], sum(k for _, k in pairs)
+    if isinstance(obj, dict):
+        pairs = {k: redact_all(v) for k, v in obj.items()}
+        return {k: x for k, (x, _) in pairs.items()}, sum(k for _, k in pairs.values())
+    return obj, 0
+
+
 def api(method, path, payload=None):
-    """Forgejo API call. Returns parsed JSON, or None on failure."""
+    """Forgejo API call. Returns parsed JSON, or None on failure. Every request
+    body is redacted before it leaves (CNVYR-456): this is the one choke point
+    all posts pass through — inline comments, the summary, and the status
+    description — so no post path can carry a secret value out."""
     url = f"{os.environ['API']}{path}"
-    data = json.dumps(payload).encode() if payload is not None else None
+    data = None
+    if payload is not None:
+        payload, n = redact_all(payload)
+        # And the encoded body, as a belt: nothing the walk missed goes out.
+        body, m = redact(json.dumps(payload))
+        n += m
+        if n:
+            print(f"redacted {n} secret value(s) from {method} {path} before posting",
+                  file=sys.stderr)
+        data = body.encode()
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"token {os.environ['TOKEN']}",
         "Content-Type": "application/json",
@@ -129,7 +271,7 @@ def api(method, path, payload=None):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read() or "null")
     except urllib.error.HTTPError as e:
-        body = e.read()[:500].decode(errors="replace")
+        body = redact(e.read()[:500].decode(errors="replace"))[0]
         print(f"{method} {path} -> HTTP {e.code}: {body}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001 — network, DNS, timeout: same handling
         print(f"{method} {path} -> {e}", file=sys.stderr)
@@ -209,7 +351,7 @@ def baseline(reviews, issue_comments):
 def collect_diff(base_sha, head_sha):
     """(diff text, review guidance). Merge-base, so unrelated base commits
     landed since the branch forked are not attributed to this PR."""
-    sh("git", "fetch", "--no-tags", "origin", base_sha, head_sha)
+    fetch(base_sha, head_sha)
     merge_base = sh("git", "merge-base", base_sha, head_sha).strip() or base_sha
     diff = sh("git", "diff", f"{merge_base}..{head_sha}")
     guidance = sh("git", "show", f"{merge_base}:.forgejo/claude-review.md")
@@ -222,7 +364,13 @@ def changed_since(since, head):
     review yet, or a rebase left it off this branch's history."""
     if not since:
         return None
-    sh("git", "fetch", "--no-tags", "origin", since)
+    try:
+        fetch(since)
+    except RuntimeError as e:
+        # A rebase can leave `since` on no ref, and then it cannot be fetched.
+        # Reviewing everything is the safe side; the head itself was fetched.
+        print(f"{e}; reviewing the whole diff", file=sys.stderr)
+        return None
     if subprocess.run(["git", "merge-base", "--is-ancestor", since, head],
                       capture_output=True).returncode != 0:
         return None
@@ -336,8 +484,9 @@ hunk in it. Stopping after the two or three most obvious problems is the failure
 mode here: it drips one issue per push and the author pays for another round
 trip to learn the rest, so a partial review is worse than a slow one.
 
-READ AROUND THE DIFF. You have Read, Grep and Glob over the checkout, and a hunk
-in isolation is not enough to judge one. Before reporting — or clearing — a
+READ AROUND THE DIFF. You have Read, Grep and Glob over the checkout at
+{checkout} (the diff's paths are relative to it; use them as they are in
+findings), and a hunk in isolation is not enough to judge one. Before reporting — or clearing — a
 change, look at what it depends on: the callers of a function whose contract
 moved, the other implementations of an interface, the tests that cover it, the
 comments and docs that describe it. Most real defects are only visible from
@@ -421,19 +570,88 @@ def ask_claude(prompt, label=""):
     outside it. Read/Grep/Glob stay on — reading around the diff is the useful
     part and, confined to the checkout, it exfiltrates nothing. The CLI has no
     temperature or seed setting; repeatability comes from the chunking and the
-    carried-forward findings, not from sampling."""
+    carried-forward findings, not from sampling.
+
+    NOT IN THE CHECKOUT (CNVYR-451). Claude Code loads project config from its
+    cwd: `.claude/settings.json` hooks run shell commands whatever
+    --disallowed-tools says, `.mcp.json` servers are started, and CLAUDE.md is
+    read as instructions. The checkout is the PR's content and this process
+    holds the OAuth token, so claude starts in an empty temp dir, sees the
+    checkout only through --add-dir (which loads no settings or CLAUDE.md from
+    it), loads user settings only and no MCP servers at all. Its environment
+    has no job token: main() has scrubbed .git/config, and TOKEN is dropped."""
+    checkout = os.getcwd()
+    # Deny reads outside the checkout (CNVYR-456), defence in depth. Headless
+    # `claude -p` on 2.1.306 already denies a Read it was not granted — nothing
+    # grants /etc, /home, /proc — but that is the default permission mode, not a
+    # guarantee: a future flag, a user settings.json, or another --add-dir could
+    # grant one. A deny rule holds regardless and always beats a grant (that is
+    # why the .git rule bites though --add-dir grants the checkout). A path needs
+    # a DOUBLE leading slash to be read as absolute: `Read(/etc/**)` matches
+    # nothing, `Read(//etc/**)` denies — checked with a canary on 2.1.306, as
+    # was each root below. A root that CONTAINS the checkout is left out: denying
+    # it would also deny the checkout, which claude must read.
+    roots = ("/proc", "/sys", "/etc", "/root", "/home", "/tmp")
+    outside = [f"Read(/{r}/**)" for r in roots
+               if checkout != r and not checkout.startswith(r + "/")]
     try:
-        p = subprocess.run(
-            ["claude", "-p", "--output-format", "text",
-             "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit",
-             "WebFetch", "WebSearch", "Task"],
-            input=prompt, capture_output=True, text=True, timeout=CALL_TIMEOUT)
+        with tempfile.TemporaryDirectory(prefix="claude-review-") as cwd, \
+                tempfile.TemporaryDirectory(prefix="claude-home-") as home:
+            # Clean environment (CNVYR-456): only what claude needs, nothing a
+            # leaked read could hand on. A fresh empty HOME (so no stray user
+            # settings), the OAuth token it authenticates with, PATH and locale.
+            # Everything else is dropped — the job token (TOKEN), and the
+            # runner's GITHUB_*, ACTIONS_* and RUNNER_*, which are the same
+            # credential by another name. An allow-list, not a deny-list: a new
+            # secret variable the runner adds later is dropped by default.
+            # Proxy and CA settings stay (F4): no secret, and without them a
+            # runner behind a proxy or a private CA cannot reach the API. A
+            # credential in a proxy URL is in secret_values(), so redacted.
+            env = {"HOME": home}
+            for k in ("PATH", "CLAUDE_CODE_OAUTH_TOKEN", "LANG", "LC_ALL",
+                      "LC_CTYPE", "TERM", *PROXY_VARS, "SSL_CERT_FILE", "SSL_CERT_DIR",
+                      "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"):
+                if os.environ.get(k):
+                    env[k] = os.environ[k]
+            p = subprocess.run(
+                ["claude", "-p", "--output-format", "text",
+                 "--setting-sources", "user",
+                 "--strict-mcp-config", "--mcp-config", '{"mcpServers": {}}',
+                 "--add-dir", checkout,
+                 "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit",
+                 "WebFetch", "WebSearch", "Task",
+                 # Nothing under .git: it is where a job token would sit. A
+                 # Read rule covers Grep and Glob; `//` is an absolute path.
+                 f"Read(/{checkout}/.git/**)", *outside],
+                input=prompt, capture_output=True, text=True, timeout=CALL_TIMEOUT,
+                cwd=cwd, env=env)
     except subprocess.TimeoutExpired:
         print(f"{label}: claude timed out after {CALL_TIMEOUT}s", file=sys.stderr)
         return ""
     if p.returncode != 0:
-        print(f"{label}: claude exited {p.returncode}: {p.stderr[:500]}", file=sys.stderr)
+        # Redact, then cut: the other way round could split a secret in half.
+        # `claude -p` prints API errors (expired OAuth token, 429, overloaded) on
+        # STDOUT and leaves stderr empty, so log both (HLP-848).
+        print(f"{label}: claude exited {p.returncode}: stderr={redact(p.stderr)[0][:2000]!r} "
+              f"stdout={redact(p.stdout)[0][:500]!r}", file=sys.stderr)
+        # CNVYR-454: a quota wall is not a broken review; main() says "retry".
+        text = p.stderr + "\n" + p.stdout
+        if re.search(r"rate.limit|usage.limit", text, re.I):
+            RATE_LIMITED[label] = retry_hint(text)
     return p.stdout
+
+
+RATE_LIMITED = {}  # call label ("part 2/5") -> retry hint, per model call that hit the rate limit
+
+
+def retry_hint(text):
+    """When the limit resets, if the CLI said: `...limit reached|1760000000`
+    (epoch) or `... resets 3am`. Else a flat hour."""
+    m = re.search(r"\|(\d{10})\b", text)
+    if m:
+        return time.strftime("%H:%M UTC", time.gmtime(int(m.group(1))))
+    m = re.search(r"resets?\s+(?:at\s+)?([0-9][^\n.]{0,24})", text, re.I)
+    return m.group(1).strip() if m else "~1h"
 
 
 def parse(out):
@@ -546,13 +764,24 @@ def describe(found, gap=""):
     return state, desc if len(desc) <= 255 else desc[:254] + "…"
 
 
-def publish_status(repo, pr, head):
-    """Recompute every finding on the PR and set `review-findings` on head."""
+def publish_status(repo, pr, head, hold="", unreviewed=()):
+    """Recompute every finding on the PR and set `review-findings` on head.
+    `hold` (CNVYR-460): the run only lost parts to the rate limit, so the status
+    is pending, "<hold>; N open: F1; unreviewed: a, b", never red: the open
+    findings stay visible and the reader of `hold` cuts it at the first `;`."""
     try:
         reviews = get_all(f"/repos/{repo}/pulls/{pr}/reviews")
         issue_comments = get_all(f"/repos/{repo}/issues/{pr}/comments")
         found = findings_state(review_comments(repo, pr, reviews), issue_comments)
         state, desc = describe(found, gaps(reviews, issue_comments))
+        if hold:
+            opened = [i for i, f in found.items() if f["state"] == "open"]
+            state = "pending"
+            desc = "; ".join(t for t in (
+                hold, f"{len(opened)} open: {', '.join(opened)}" if opened else "",
+                f"unreviewed: {', '.join(unreviewed)}" if unreviewed else "") if t)
+            # ponytail: hard cap for the status column; the full list is in the review.
+            desc = desc if len(desc) <= 255 else desc[:254] + "…"
     except RuntimeError as e:
         print(e, file=sys.stderr)
         state, desc = "error", "could not read the findings; see the review job log"
@@ -613,10 +842,32 @@ def place(f, valid):
     return path, line, extra, note
 
 
+def pr_title(event_path=None):
+    # From the event file, never a `${{ }}` env value: the runner re-evaluates
+    # expressions found inside PR-controlled text, so a title holding
+    # `${{ secrets.X }}` would expand in a job with secrets (CNVYR-446).
+    try:
+        with open(event_path or os.environ["GITHUB_EVENT_PATH"]) as f:
+            return json.load(f)["pull_request"]["title"]
+    except (KeyError, OSError, ValueError, TypeError):
+        return ""
+
+
 def main():
     repo, pr = os.environ["REPO"], os.environ["PR"]
     head = os.environ["HEAD_SHA"]
-    diff, guidance = collect_diff(os.environ["BASE_SHA"], head)
+    try:
+        scrub_credentials()
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        set_status(repo, pr, head, "error", "credential in the checkout; see the review job log")
+        return 1
+    try:
+        diff, guidance = collect_diff(os.environ["BASE_SHA"], head)
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        set_status(repo, pr, head, "error", "could not fetch the PR's commits; see the review job log")
+        return 1
     if not diff.strip():
         print("empty diff, nothing to review")
         return publish_status(repo, pr, head)
@@ -661,7 +912,7 @@ def main():
         c, t = todo[k], time.monotonic()
         files = "\n".join(f"  - {p}" + (" (part)" if p in split else "") for p in c["paths"])
         result = parse(ask_claude(PROMPT.format(
-            repo=repo, title=os.environ.get("PR_TITLE", ""), part=f"{k + 1} of {n}",
+            repo=repo, title=pr_title(), part=f"{k + 1} of {n}", checkout=os.getcwd(),
             files=files, guidance=guidance_block, prior=prior, diff=c["diff"]),
             f"part {k + 1}/{n}"))
         print(f"part {k + 1}/{n}: {len(c['paths'])} file(s), {size(c['diff'])} B, "
@@ -673,6 +924,17 @@ def main():
     # A file split over several parts is covered only if all of them were.
     missed = sorted({p for c, r in zip(todo, results) if r is None for p in c["paths"]})
     total = len({p for c in parts for p in c["paths"]})
+    # CNVYR-460: if every part that failed hit the rate limit, the gap closes by
+    # itself after the reset: pending (once the findings are posted), not red.
+    # Only the parts that were tried count: those past MAX_CHUNKS were never
+    # sent, and the next run covers them first (missed files go first).
+    limited = [RATE_LIMITED[f"part {k + 1}/{n}"] for k, r in enumerate(results)
+               if r is None and f"part {k + 1}/{n}" in RATE_LIMITED]
+    only_limit = bool(limited) and len(limited) == sum(r is None for r in results[:n])
+    if not any(results) and only_limit:
+        # CNVYR-454: red here would block the merge for a limit that resets by
+        # itself. Pending, no comment: nothing was reviewed, nothing to say.
+        return publish_status(repo, pr, head, f"rate-limited, retry after {limited[0]}")
     if not any(results):
         # The CLI is down, out of quota or logged out: a review saying
         # "0/N reviewed" on every push would be noise, so one comment says so.
@@ -725,6 +987,9 @@ def main():
         print(f"review posted: {total - len(missed)}/{total} files covered, "
               f"{len(inline)} inline, {len(demoted)} in summary, {repeats} already raised, "
               f"{outside} off this push's lines")
+        if only_limit:
+            return publish_status(repo, pr, head,
+                                  f"rate-limited, retry after {limited[0]}", missed)
         return publish_status(repo, pr, head)
     # A rejected review (a stale commit_id, a line the API disagrees about)
     # must not swallow the findings — they go up as a plain comment instead.
@@ -747,7 +1012,7 @@ def summary(reviewed, inline, demoted, repeats, head, total, missed=(), since=No
     out += ["", cov + "."]
     if missed:
         out += ["", f"**Not reviewed** (the model call failed, or past the {MAX_CHUNKS}-call "
-                    "cap; the status stays red until a run covers them): "
+                    "cap; the status is not green until a run covers them): "
                     + ", ".join(f"`{p}`" for p in missed)]
     if not inline and not demoted and not missed:
         out.append("\nNothing to change." if not repeats else

@@ -1,0 +1,91 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-007 — a literal `${{` in a scalar the runner parses (`run:`, `name:`,
+# `if:`, and the values of `env:` and `with:`) that is not a complete, intended
+# expression (CNVYR-459 for `run:`, CNVYR-473 for the rest; from 2026-10-21:
+# gitops#351's job failed schema validation because a shell comment in `run:`
+# said "never through ${{ }}"; the same text broke assistant#204's first run).
+# Checked against the runner source (nektos/act v0.2.89, pkg/schema
+# checkExpression, 2026-10-23): it takes every YAML scalar's decoded value,
+# finds each `${{` and parses what follows up to `}}`; an unclosed or empty
+# expression is a parse error, and the job never starts. The decoded value of a
+# `run: |` block includes its `#` shell comments, so a comment in the body is
+# parsed like code. A YAML comment (`# …` outside a scalar, top of file or
+# between keys) is not part of any scalar's value, so the runner never sees it:
+# not flagged, and the docs entry's "or a YAML comment" overstates that.
+#
+# Structural (YAML) rule: a value of `run:`, `name:`, `if:`, or of any key under
+# `env:` or `with:`, in which, in the text of the value,
+#   - `${{` is followed by `}}` with nothing in between (the literal `${{ }}`),
+#   - `${{` has no `}}` after it on the same line (unclosed), or
+#   - (`run:` only) a shell comment line (first non-blank character `#`)
+#     contains `${{`: a comment is never an intended expression, and a complete
+#     one is still interpolated into the script text. The other keys have no
+#     shell, so a `#` there is plain text and a complete expression is fine.
+# A real `${{ github.sha }}` is not flagged, and neither is a bare
+# `if: github.x == 'y'` (no opener at all).
+# Not covered: `${{` in other keys (`runs-on`, `uses`, `working-directory`,
+# `concurrency`, `strategy`, `outputs`, `secrets:` of a reusable call …), a
+# trailing comment after code (`cmd # ${{ x }}`), and `}}` hidden in a string
+# literal inside an expression. A map nested inside `env:`/`with:` is reported
+# once per level.
+rules:
+- id: LJV-007
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    A literal expression opener in workflow text: `run:` (shell comments
+    included), `name:`, `if:`, or an `env:` / `with:` value.
+
+    The runner parses every `${{` in such a value as the start of an
+    expression, and an unclosed or empty one (`${{ }}`) fails the job at schema
+    validation before any step runs. Fix: reword it so the opener never appears
+    ("never through a workflow expression"). When an expression is meant, close
+    it and, in `run:`, keep it out of comments.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-007-a-literal-expression-opener-in-run-text-or-comments
+  metadata:
+    lesson: LJV-007
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-007-a-literal-expression-opener-in-run-text-or-comments
+  pattern-either:
+  # metavariable-regex matches from the start of the text, hence the leading .*?
+  - patterns:
+    - pattern: |
+        run: $V
+    - metavariable-regex:
+        metavariable: $V
+        regex: |-
+          (?xs)
+          .*?
+          (?: \$\{\{ [ \t]* \}\}
+            | \$\{\{ (?: (?!\}\}) [^\n] )* (?: \n | \z )
+            | (?: \A | \n ) [ \t]* \# [^\n]* \$\{\{ )
+  - patterns:
+    - pattern-either:
+      - pattern: |
+          name: $V
+      - pattern: |
+          if: $V
+    - metavariable-regex:
+        metavariable: $V
+        regex: &opener |-
+          (?xs)
+          .*?
+          (?: \$\{\{ [ \t]* \}\}
+            | \$\{\{ (?: (?!\}\}) [^\n] )* (?: \n | \z ) )
+  # a value under env: / with:. The key itself ($K) is excluded so that the
+  # env:/with: pair, whose "value" is the whole map, is not reported twice.
+  - patterns:
+    - pattern: |
+        $K: $V
+    - pattern-inside: |
+        $P: $M
+    - metavariable-regex:
+        metavariable: $P
+        regex: ^(?:env|with)$
+    - metavariable-regex:
+        metavariable: $K
+        regex: ^(?!(?:env|with)$)
+    - metavariable-regex:
+        metavariable: $V
+        regex: *opener

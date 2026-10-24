@@ -1,0 +1,93 @@
+# Fixture for LJV-006 (see LJV-001's fixture for the comment format).
+# CNVYR-446's claude-review.yml, the case that taught this lesson:
+on:
+  pull_request:
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          # ruleid: LJV-006
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          # ruleid: LJV-006
+          PR_BODY: ${{ github.event.pull_request.body }}
+          # ruleid: LJV-006
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          # ruleid: LJV-006
+          REF: ${{ github.head_ref }}
+          # ruleid: LJV-006
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # ok: LJV-006
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # ok: LJV-006
+          PR: ${{ github.event.pull_request.number }}
+          # ruleid: LJV-006
+          WRAPPED: ${{ format('{0}', github.event.pull_request.title) }}
+          # ruleid: LJV-006
+          MSG: ${{ github.event.head_commit.message }}
+          # ok: LJV-006
+          SHA_THEN_TEXT: ${{ github.sha }} github.event.pull_request.title
+          # CNVYR-449: workflow_run fields (the privileged half of the PR workflow pair)
+          # ruleid: LJV-006
+          WR_MSG: ${{ github.event.workflow_run.head_commit.message }}
+          # ruleid: LJV-006
+          WR_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name }}
+          # ruleid: LJV-006
+          WR_TITLE: ${{ github.event.workflow_run.display_title }}
+          # ruleid: LJV-006
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          # ruleid: LJV-006
+          WR_FORK: ${{ github.event.workflow_run.head_repository.description }}
+          # ruleid: LJV-006
+          WR_BRACKET: ${{ github.event['workflow_run']['head_commit']['message'] }}
+          # ruleid: LJV-006
+          PUSH_AUTHOR: ${{ github.event.head_commit.committer.name }}
+          # ruleid: LJV-006
+          B_TITLE: ${{ github.event['pull_request']['title'] }}
+          # ruleid: LJV-006
+          B_MIXED_BODY: ${{ github.event.pull_request['body'] }}
+          # ruleid: LJV-006
+          B_MIXED_EVENT: ${{ github['event'].pull_request.title }}
+          # ruleid: LJV-006
+          B_DQUOTE: ${{ github["event"]["issue"]["title"] }}
+          # ruleid: LJV-006
+          B_HEAD_REF: ${{ github.event['pull_request']['head']['ref'] }}
+          # ruleid: LJV-006
+          B_HEAD_REF_NAME: ${{ github['head_ref'] }}
+          # ruleid: LJV-006
+          B_UPPER: ${{ github.event.pull_request.TITLE }}
+          # ruleid: LJV-006
+          FORK_NAME: ${{ github.event.pull_request.head.repo.name }}
+          # ruleid: LJV-006
+          FORK_DESC: ${{ github.event.pull_request.head.repo.description }}
+          # ruleid: LJV-006
+          FORK_FULL: ${{ github.event.pull_request.head.repo.full_name }}
+          # ruleid: LJV-006
+          FORK_BRACKET: ${{ github.event.pull_request.head['repo']['description'] }}
+          # ruleid: LJV-006
+          REF_NAME: ${{ github.ref_name }}
+          # ruleid: LJV-006
+          REF_NAME_BRACKET: ${{ github['ref_name'] }}
+          # ruleid: LJV-006
+          REF_NAME_IN_FN: ${{ format('deploy-{0}', github.ref_name) }}
+          # CNVYR-449 negatives: brackets and workflow_run on safe fields, text after }}
+          # ok: LJV-006
+          B_NUMBER: ${{ github.event['pull_request']['number'] }}
+          # ok: LJV-006
+          B_HEAD_SHA: ${{ github['event']['pull_request']['head']['sha'] }}
+          # ok: LJV-006
+          WR_ID: ${{ github.event.workflow_run.id }}
+          # ok: LJV-006
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          # ok: LJV-006
+          WR_TEXT_AFTER: ${{ github.sha }} github.event.workflow_run.display_title
+          # ok: LJV-006
+          REF_TEXT_AFTER: ${{ github.run_id }} github.ref_name
+          # ok: LJV-006
+          EVENT_NAME: ${{ github.event_name }}
+        # ruleid: LJV-006
+        run: echo "${{ github.event.comment.body }}"
+      # ruleid: LJV-006
+      - if: contains(github.event.issue.title, 'x') && ${{ github.event.issue.title != '' }}
+        # ok: LJV-006
+        run: jq -r .pull_request.title "$GITHUB_EVENT_PATH"

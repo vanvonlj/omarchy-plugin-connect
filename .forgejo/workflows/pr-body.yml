@@ -1,0 +1,49 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/workflows/
+# Edit it there and re-run `ops/forgejo-ci/rollout.py apply --yes`. A local edit here
+# is reported as drift by `rollout.py check` and overwritten on the next apply.
+#
+# The lint is `.forgejo/pr-body-lint.mjs`, synced next to this file from
+# ops/forgejo-ci/files/ (vendored from lukejv-dev/assistant scripts/pr-body-lint.ts,
+# CNVYR-412). It fails a PR whose body lacks Evidence, Reachability, Not proven or its
+# order lines; `lint: skip <reason>` in the body skips it.
+
+name: pr-body
+
+# Runs PR-controlled content (the body text) through a script, so: no secrets here.
+# PR text (body, title, branch) is read by the script from $GITHUB_EVENT_PATH and is
+# never placed in a workflow expression: the runner evaluates expressions found inside
+# substituted values (injection, CNVYR-446).
+"on":
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  pr-body:
+    # catthehacker/ubuntu:act-24.04 already has node and git; the script is plain .mjs
+    # and needs no install.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changed-files diff needs the history of both sides.
+          fetch-depth: 0
+          # No job token left in .git/config: the script below is read from the PR's
+          # own repo, and this job needs no write access (CNVYR-451).
+          persist-credentials: false
+      # The lint comes from the BASE branch, so a PR cannot edit it to exit 0 (CNVYR-450).
+      # The checkout above only supplies the git history for the diff. The base name is
+      # read from the event file by node, never through a workflow expression.
+      - name: Lint the PR body (script from the base branch)
+        run: |
+          set -euo pipefail
+          base=$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")).pull_request?.base?.ref ?? "main"))')
+          lint="$RUNNER_TEMP/pr-body-lint.mjs"
+          if git show "origin/$base:.forgejo/pr-body-lint.mjs" > "$lint" 2>/dev/null; then
+            echo "pr-body-lint: using .forgejo/pr-body-lint.mjs from origin/$base"
+          else
+            echo "::warning::.forgejo/pr-body-lint.mjs is not on origin/$base yet; linting with this PR's own copy, which this PR can edit"
+            cp .forgejo/pr-body-lint.mjs "$lint"
+          fi
+          node "$lint" --event "$GITHUB_EVENT_PATH"

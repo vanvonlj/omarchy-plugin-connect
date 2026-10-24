@@ -1,0 +1,136 @@
+# Fixture for LJV-007 (see LJV-001's fixture for the comment format).
+# The finding is on the `run:` key, so the marker goes right above it.
+# A YAML comment is not part of any scalar the runner parses (act's checkExpression
+# reads decoded values), so this one is fine: never through ${{ }} and ${{ github.x
+# gitops#351's job, the case that taught this lesson:
+# The same applies to name:, if: and the values under env: and with: (CNVYR-473).
+name: Plan
+on:
+  pull_request:
+env:
+  # ok: LJV-007
+  TOP_FINE: "${{ github.sha }}"
+  # ruleid: LJV-007
+  TOP_BAD: "built from ${{ }}"
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    env:
+      # ok: LJV-007
+      PLAIN: value
+      # ruleid: LJV-007
+      JOB_BAD: "sha is ${{ github.x"
+    steps:
+      - name: Shell comment with an empty expression
+        # ruleid: LJV-007
+        run: |
+          # PR text goes through the event file, never through ${{ }}
+          ./plan.sh
+      - name: Unclosed on a line
+        # ruleid: LJV-007
+        run: |
+          echo "sha is ${{ github.x"
+          ./plan.sh
+      - name: Unclosed, the next line closes another
+        # ruleid: LJV-007
+        run: |
+          echo "a ${{ github.sha"
+          echo "b ${{ github.run_id }}"
+      - name: Literal empty expression in code
+        # ruleid: LJV-007
+        run: echo "never ${{ }} here"
+      - name: Empty, no space
+        # ruleid: LJV-007
+        run: echo "${{}}"
+      - name: A complete expression in a shell comment
+        # ruleid: LJV-007
+        run: |
+          ./plan.sh
+          # built from ${{ github.sha }}
+      - name: Indented comment, unclosed
+        # ruleid: LJV-007
+        run: |
+          if true; then
+              # see ${{ github.event
+              ./plan.sh
+          fi
+      - name: Closed expression first, unclosed after it
+        # ruleid: LJV-007
+        run: echo "${{ github.sha }} and ${{ github.run_id"
+      # ok: LJV-007
+      - run: echo "${{ github.sha }}"
+      - name: Real expressions, two on a line, a multi-line block
+        # ok: LJV-007
+        run: |
+          # commit and run id, no opener in this comment
+          echo "${{ github.sha }} ${{ github.run_id }}"
+          echo "${HOME} ${{ github.repository }}"
+      - name: The fix, a reworded comment
+        # ok: LJV-007
+        run: |
+          # PR text goes through the event file, never through a workflow expression
+          ./plan.sh
+      - name: A hash that is not a comment
+        # ok: LJV-007
+        run: echo "build #${{ github.run_number }}"
+
+  scalars:
+    # ruleid: LJV-007
+    name: Job name with ${{ }}
+    runs-on: ubuntu-latest
+    steps:
+      - # ruleid: LJV-007
+        name: "Step name, unclosed ${{ github.sha"
+        run: ./plan.sh
+      - name: Empty expression in if
+        # ruleid: LJV-007
+        if: ${{ }}
+        run: ./plan.sh
+      - name: Unclosed expression in if
+        # ruleid: LJV-007
+        if: ${{ github.event_name == 'push'
+        run: ./plan.sh
+      - name: With values
+        uses: actions/checkout@v4
+        with:
+          # ok: LJV-007
+          ref: ${{ github.sha }}
+          # ruleid: LJV-007
+          path: "x/${{}}"
+          # ok: LJV-007
+          token: plain
+      - name: Step env
+        env:
+          # ruleid: LJV-007
+          ONLY: "${{ secrets.X"
+        run: ./plan.sh
+      - name: Step env, empty after a closed one
+        env:
+          # ok: LJV-007
+          A: ${{ github.sha }}
+          # ruleid: LJV-007
+          B: "${{ github.sha }} and ${{ }}"
+        run: ./plan.sh
+      - name: Multi-line env value
+        env:
+          # ruleid: LJV-007
+          NOTE: |
+            first line
+            then ${{ github.run_id
+        run: ./plan.sh
+      # ok: LJV-007
+      - name: Real expression in a name ${{ github.sha }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: ./plan.sh
+      # ok: LJV-007
+      - name: A bare if, no opener
+        if: github.event_name == 'push'
+        run: ./plan.sh
+      # ok: LJV-007
+      - name: Text with no opener, a hash is plain text # and a YAML comment ${{ }} is never parsed
+        env:
+          # ok: LJV-007
+          HASH: "#${{ github.run_number }}"
+          # ok: LJV-007
+          PLAIN: "no opener # here"  # nor ${{ in this YAML comment
+        run: ./plan.sh
