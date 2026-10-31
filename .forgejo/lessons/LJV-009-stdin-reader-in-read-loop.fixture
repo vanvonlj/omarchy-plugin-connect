@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Fixture for LJV-009 (see LJV-001's fixture for the comment format).
+# The finding is on the command, so the marker goes on the line above it.
+# tfplan-creds, homelab-provision#65 F2/F3: ssh in a `while read` loop.
+# Never run: the commands are only text for the rule.
+set -euo pipefail
+
+# --- positives: the loop's input is stdin (or a file) and the command reads stdin
+while IFS= read -r vm; do
+  echo "granting $vm"
+  # ruleid: LJV-009
+  ssh root@pve "pveum acl modify /vms/$vm --users x@pve --roles R"
+  echo "done $vm"
+done < vms.txt
+
+# cmd | while read
+qm list | while read -r vmid name; do
+  # ruleid: LJV-009
+  ssh -o ConnectTimeout=5 -p 2222 "root@$name" 'systemctl restart x; echo ok'
+done
+
+# one line
+# ruleid: LJV-009
+cat hosts | while read h; do ssh "$h" uptime; done
+
+# second command after a safe one; behind sudo, VAR=x, && and if
+while read -r h; do
+  ssh -n "$h" true
+  # ruleid: LJV-009
+  sudo -E ssh "$h" uptime
+done < hosts
+while read -r h; do
+  if [ -n "$h" ]; then
+    # ruleid: LJV-009
+    LC_ALL=C ssh "$h" uptime 2>&1 | tee -a log
+  fi
+done < hosts
+while read -r h; do
+  # ruleid: LJV-009
+  test -n "$h" && ssh "$h" uptime >/dev/null 2>&1
+done < hosts
+
+# -o NAME with an n in it is not -n; neither is an -n inside a quoted remote command
+while read -r h; do
+  # ruleid: LJV-009
+  ssh -oConnectTimeout=5 "$h" 'ls -n /tmp'
+done < hosts
+
+# backslash continuation, redirect after a quote with a semicolon in it
+while read -r h; do
+  # ruleid: LJV-009
+  ssh -o BatchMode=yes \
+      "$h" 'a; b' > out.txt
+done < hosts
+
+# the same bug with other stdin readers
+kubectl get ns -o name | while read -r ns; do
+  # ruleid: LJV-009
+  kubectl -n "${ns#namespace/}" exec -i deploy/app -- sh -c 'cat >/tmp/x'
+done
+while read -r c; do
+  # ruleid: LJV-009
+  docker exec -it "$c" sh
+done < containers
+while read -r c; do
+  # ruleid: LJV-009
+  podman run --rm -i alpine cat
+done < images
+
+# --- negatives
+# ssh -n / -f, alone or clustered, anywhere among the options
+while read -r h; do
+  # ok: LJV-009
+  ssh -n "$h" uptime
+  # ok: LJV-009
+  ssh -nT -o BatchMode=yes "$h" uptime
+  # ok: LJV-009
+  ssh -p 22 -n "$h" uptime
+  # ok: LJV-009
+  ssh -f "$h" 'sleep 1'
+done < hosts
+
+# stdin taken from somewhere else
+while read -r h; do
+  # ok: LJV-009
+  ssh "$h" uptime </dev/null
+  # ok: LJV-009
+  ssh "$h" uptime < /dev/null 2>&1
+  # ok: LJV-009
+  ssh "$h" sh <<EOT
+echo hi
+EOT
+  # ok: LJV-009
+  ssh "$h" cat <<<"text"
+  # ok: LJV-009
+  echo data | ssh "$h" 'cat > /tmp/x'
+  # ok: LJV-009
+  ssh "$h" uptime &
+  # ok: LJV-009
+  kubectl exec -i pod -- cat </dev/null
+done < hosts
+
+# kubectl / docker without a stdin flag, or with it only after `--`
+while read -r ns; do
+  # ok: LJV-009
+  kubectl -n "$ns" exec pod -- ls
+  # ok: LJV-009
+  kubectl -n "$ns" exec pod -- grep -i x /etc/hosts
+  # ok: LJV-009
+  docker exec "$ns" ls
+  # ok: LJV-009
+  docker ps -q
+done < namespaces
+
+# the loop reads another descriptor, so ssh's stdin is not its input
+while read -r -u 3 h; do
+  # ok: LJV-009
+  ssh "$h" uptime
+done 3< hosts
+while read -ru3 h; do
+  # ok: LJV-009
+  ssh "$h" uptime
+done 3< hosts
+while IFS= read -r h <&3; do
+  # ok: LJV-009
+  ssh "$h" uptime
+done 3< hosts
+while read -r h; do
+  # ok: LJV-009
+  ssh "$h" uptime
+done <&3
+
+# not in a read loop
+# ok: LJV-009
+ssh root@pve uptime
+for h in a b c; do
+  # ok: LJV-009
+  ssh "$h" uptime
+done
+while [ -n "$x" ]; do
+  # ok: LJV-009
+  ssh "$x" uptime
+done
+
+# after the loop, or another command in the loop
+while read -r h; do
+  echo "$h"
+done < hosts
+# ok: LJV-009
+ssh root@pve uptime
+while read -r h; do
+  # ok: LJV-009
+  ssh-keygen -R "$h"
+  # ok: LJV-009
+  echo "ssh $h"
+  # ssh "$h" uptime
+done < hosts

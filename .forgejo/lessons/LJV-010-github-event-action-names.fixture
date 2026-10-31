@@ -1,0 +1,82 @@
+# Fixture for LJV-010 (see LJV-001's fixture for the comment format).
+# The first filter of #474's claude-review.yml, the case that taught this lesson:
+on:
+  pull_request:
+    # ok: LJV-010
+    types: [labeled, synchronize]
+  # ok: LJV-010
+  issues:
+    types: [labeled, unlabeled]
+concurrency:
+  # ruleid: LJV-010
+  group: review-${{ github.event.action == 'labeled' && 'ignored' || 'run' }}
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # ruleid: LJV-010
+    if: github.event.action == 'labeled'
+    steps:
+      # ruleid: LJV-010
+      - if: github.event.action != 'synchronize'
+        run: echo one
+      # ruleid: LJV-010
+      - if: ${{ github.event.action == "unlabeled" }}
+        run: echo two
+      # ruleid: LJV-010
+      - if: github.event.action=='labeled'
+        run: echo three
+      # ruleid: LJV-010
+      - if: github['event']['action'] == 'labeled'
+        run: echo bracket syntax
+      # ruleid: LJV-010
+      - if: github.event["action"] == 'unlabeled'
+        run: echo mixed brackets
+      # ruleid: LJV-010
+      - if: ${{ 'synchronize' == github.event.action }}
+        run: echo reversed
+      # ruleid: LJV-010
+      - if: github.event.action == 'Labeled'
+        run: echo the comparison ignores case
+      # ruleid: LJV-010
+      - if: github.event.pull_request.draft == false && github.event.action != 'synchronize'
+        run: echo after another test
+      # ruleid: LJV-010
+      - run: echo "${{ github.event.action == 'labeled' }}"
+      - env:
+          # ruleid: LJV-010
+          IGNORED: ${{ github.event.action == 'unlabeled' && 'yes' || 'no' }}
+        run: echo four
+      # Forgejo's own names, and other actions both platforms share:
+      # ok: LJV-010
+      - if: github.event.action == 'label_updated'
+        run: echo five
+      # ok: LJV-010
+      - if: github.event.action == 'label_cleared'
+        run: echo six
+      # ok: LJV-010
+      - if: github.event.action != 'synchronized'
+        run: echo seven
+      # ok: LJV-010
+      - if: github.event.action == 'opened' || github.event.action == 'reopened'
+        run: echo eight
+      # ok: LJV-010
+      - if: ${{ github.event.action == "label_updated" }}
+        run: echo nine
+      # ok: LJV-010
+      - if: ${{ 'synchronized' == github.event.action }}
+        run: echo reversed, Forgejo name
+      # The GitHub name in a comment or as plain text is not a comparison:
+      # ok: LJV-010
+      - run: echo labeled and synchronize are only words here
+      # if: github.event.action == 'labeled' is the old filter, kept as a comment
+      # ok: LJV-010
+      - if: github.event.label.name == 'labeled'
+        run: echo a label that is called labeled
+      # ok: LJV-010
+      - if: github.event.actions == 'labeled'
+        run: echo not the action field
+      # ok: LJV-010
+      - if: github.event_name == 'labeled'
+        run: echo not the action field either
+      # ok: LJV-010
+      - run: jq -r '.action' "$GITHUB_EVENT_PATH"

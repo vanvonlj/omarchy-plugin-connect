@@ -1,0 +1,87 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-009 — a command that reads stdin, inside a `while … read …` loop, with
+# stdin left as the loop's input (CNVYR-481, from 2026-10-23: `tfplan-creds`,
+# homelab-provision#65 F2/F3: `ssh` in a `while read` loop swallowed the rest of
+# the list, so only the first VM's ACL was added or removed, and the stub tests
+# hid it because a stub never reads stdin). ssh forwards the local stdin to the
+# remote command; the loop's `read` and the ssh share one descriptor, so the
+# first iteration's ssh drains what the later reads were to get.
+#
+# Regex rule on `generic`, not `bash`: opengrep only treats *.sh as bash, so a
+# `bash` rule never sees the extensionless `#!/bin/bash` scripts in scripts/ and
+# ops/. The same text is just as wrong in a workflow `run:` block or a k8s
+# `command:` script, which this also reaches (YAML block scalars are plain text).
+# Reports the line of the command, not of the `while`.
+#
+# Loop: `while [VAR=x] read …; do … done`, as `done < file` or `cmd | while …`
+# (the body is the same either way), one line or many. Command, in command
+# position of the loop body (after ; && || ( { do then else, behind sudo/env/
+# VAR=x): `ssh`; `kubectl|oc exec` with -i/-it/--stdin before any `--`;
+# `docker|podman exec|run` with -i/-it/--stdin.
+# Not flagged (stdin is not the loop's input):
+#  - the loop's `read` takes its input elsewhere: `read -u 3` / `-ru 3`, a
+#    `<&3` on the read line, or a `done … <&3` close;
+#  - ssh with `-n` or `-f` (clustered too: `-nT`), which makes ssh read /dev/null;
+#  - any input redirect on the command: `</dev/null`, `<file`, `<<EOF`, `<<<"…"`,
+#    `<(…)`; the command on the right of a pipe (`echo x | ssh …`);
+#  - the command ending in a bare `&`: a non-interactive shell gives a
+#    background job /dev/null as stdin.
+# Not covered: a loop that is not `while … read` (`while true; do read …`,
+# `until read`, `for … in $(…)`, a plain `read` called in a function), other
+# stdin readers (ffmpeg without -nostdin, mysql, psql, scp/rsync over ssh,
+# `docker compose exec`, `kubectl run -i`, `ssh -O`), a command behind a quote
+# or path (`sh -c "ssh …"`, `/usr/bin/ssh`) or a wrapper (`xargs`, `timeout 5 ssh`,
+# a function that calls ssh; `sudo -u USER ssh`), and a command after a nested loop's `done`: the
+# body is read up to the first `done`, so only what comes before it is seen.
+# Also seen as ok (a miss): ` -n`/` -f` inside ssh's remote command (`ssh h ls -n`)
+# counts as the option; `-i` for docker/podman after the container name
+# (`docker exec c grep -i x`) counts as the flag (a false positive).
+rules:
+- id: LJV-009
+  languages: [generic]
+  severity: WARNING
+  paths:
+    exclude: ["*.fixture"]
+  message: >-
+    A command that reads stdin runs inside a `while read` loop and eats the loop's input.
+
+    `ssh` (and `kubectl exec -i`, `docker exec -i`) reads the local stdin, which
+    is the same descriptor the loop's `read` takes the next line from, so the
+    first iteration's call swallows the rest of the list and only the first item
+    is processed (tfplan-creds, homelab-provision#65). Fix: `ssh -n`, or
+    `</dev/null` on the command; or read the list on another descriptor
+    (`while read -r x <&3; do …; done 3< file`, or `read -u 3`). Stubs in tests
+    never read stdin, so they hide it: test with a command that does.
+    A deliberate exception is `# nosemgrep: LJV-009` with the reason.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-009-a-stdin-reader-in-a-while-read-loop
+  metadata:
+    lesson: LJV-009
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-009-a-stdin-reader-in-a-while-read-loop
+  pattern-regex: |-
+    (?x)
+    (?(DEFINE)
+      # the rest of one command: quotes and backslash-continuations are units;
+      # stops at ; & | newline, a ` #` comment, or any `<` redirect
+      (?<cmd> (?: [ \t]+ (?!\#) | [^\s\\;&|'"<] | \\[\s\S] | '[^']*' | "(?:[^"\\]|\\[\s\S])*" | >&[0-9-]* | &>>? )* )
+      # one more character of the loop body, but never past a `done`
+      (?<step> (?! (?:\n[ \t]*|;[ \t]*) done\b ) [\s\S] )
+      # -i / -it / --stdin among the options (stops at `--`)
+      (?<stdin> (?: (?:[ \t]|\\\n)+ (?!--(?:[ \t]|\n)) \S+ )*? (?:[ \t]|\\\n)+ (?: -[A-Za-z]*i[A-Za-z]* | --stdin(?:=true)? ) (?=[ \t\\\n]|\z) )
+    )
+    (?: \A | [\n;|&({] ) [ \t]* while [ \t]+ (?: [A-Za-z_]\w*=\S*[ \t]+ )* read \b
+    (?! [^\n;]* (?: [ \t]-[A-Za-z]*u | <& ) )
+    [^\n]*? (?: ; [ \t]* | \n [ \t]* ) do \b
+    (?&step)*?
+    (?: \n | ; | && | \|\| | \( | \{ | (?<=\bdo) | \b(?:then|else) | \$\( ) [ \t]*
+    (?: (?:sudo|exec|command|time|nohup|env)[ \t]+(?:-\S+[ \t]+)* | [A-Za-z_]\w*=\S*[ \t]+ )*
+    \K (?:
+        ssh (?=[ \t]) (?! (?&cmd) [ \t] -[46AaCGgKkMNqsTtVvXxYy]*[nf][46AaCGgKkMNqsTtVvXxYy]* (?=[ \t\\\n]|\z) )
+      | (?:kubectl|oc) [ \t]+ (?:(?!exec\b)\S+[ \t]+)* exec \b (?=(?&stdin))
+      | (?:docker|podman) [ \t]+ (?:(?!(?:exec|run)\b)\S+[ \t]+)* (?:exec|run) \b (?=(?&stdin))
+      )
+    (?&cmd)
+    (?= \n | ; | && | \| | \) | \} | \z | [ \t]+\# )
+    (?&step)*?
+    (?: \n[ \t]* | ;[ \t]* ) done \b (?! [^\n]*<& )

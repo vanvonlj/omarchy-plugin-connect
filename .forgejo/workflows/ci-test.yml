@@ -1,0 +1,279 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/workflows/
+# Edit it there and re-run `ops/forgejo-ci/rollout.py apply --yes`. A local edit here
+# is reported as drift by `rollout.py check` and overwritten on the next apply.
+
+name: ci-test
+
+# Runs the test command a repo declares in `.forgejo/ci.toml` (CNVYR-508). Forgejo reads
+# only ONE workflow directory, `.forgejo` before `.github`, so a repo's `.github` test jobs
+# stop running once the managed `.forgejo/workflows` exists (CNVYR-502). This is the
+# opt-in replacement: NO ci.toml, NO test, the job exits green ("nothing to test").
+# How to opt in: ops/forgejo-ci/README.md, "The managed test job".
+#
+# TRUST MODEL — read before changing anything. What holds, and no more:
+#   * NO SECRETS. No job uses the secrets context, a `token:` input or a checkout in the test
+#     jobs. test_ci_test.py fails if one appears. Do not add a secret, a deploy step or a
+#     token to this file. A job that needs one is a different workflow.
+#   * THE IMAGE IS CHOSEN BY THE BASE BRANCH, NOT BY THE PR. `image` and `[services.postgres]`
+#     are read from the base's `.forgejo/ci.toml` (`git show origin/<base>:.forgejo/ci.toml`),
+#     the same way the parser is. From the PR's file only `test`, `workdir` and
+#     `timeout_minutes` are used. So a PR cannot run its tests in a container of its own
+#     choosing; a new or changed image takes effect once it is merged. A PR that adds the
+#     first ci.toml tests nothing ("ci.toml is new in this PR"): the job ends green, inert.
+#     A push to the default branch is merged code: base = that commit.
+#   * THE IMAGE IS TRUSTED BECAUSE MAIN CHOSE IT. The runner puts the job token, the
+#     artifact runtime token and the OIDC request token in the env of each STEP's process
+#     (act/runner/step.go:253, run_context.go:1730, internal/app/run/runner.go:306-309),
+#     not in the job container itself: the container is created with only RUNNER_* and LANG
+#     (run_context.go:537-548, 727) and the entrypoint `tail -f /dev/null` (697), so the
+#     image's own entrypoint sees none. But the image's binaries run inside the steps, so the
+#     image sees what a step carries. That is why it has to be reviewed code (the base's).
+#   * PR CODE RUNS WITH NO TOKEN. The PR's test command is the one thing it controls. Every
+#     step of `test` / `test-pg` blanks GITHUB_TOKEN, FORGEJO_TOKEN and the two
+#     ACTIONS_ID_TOKEN_REQUEST_* variables in its step `env:`, and every step but the artifact
+#     download also blanks ACTIONS_RUNTIME_TOKEN (the download needs it). The run step then
+#     starts by unsetting those and anything whose name contains "token". What the test
+#     command can still do is what any process with no credentials can: use the checkout, the
+#     network (CNVYR-510), and the CPU of the runner.
+#   * The checkout happens ONLY in `plan` (the stock runner image, which never runs PR code),
+#     the tree is packed WITHOUT .git, and `test` / `test-pg` fetch it as a run artifact.
+#   * The parser (`.forgejo/ci-test.py`) is read from the BASE branch, so a PR cannot
+#     edit it to pass; if the base has none yet, the job is skipped, never run from the
+#     PR's own copy. A PR that DELETES a ci.toml the base has fails.
+#   * THIS FILE IS NOT PROTECTED THE SAME WAY. Forgejo runs a pull_request workflow from the
+#     PR head, so a same-repo PR can edit or delete ci-test.yml itself. The base-ref parser
+#     protects the parsing, not this file. Only branch protection (require `ci-test / result`)
+#     plus review of any change under .forgejo/workflows/ makes it a boundary.
+#   * No PR text (title, body, branch) is placed in a workflow expression: the runner
+#     substitutes it and act re-evaluates expressions inside it (CNVYR-446). The values
+#     that do travel between jobs (image, timeout, workdir, postgres settings) are
+#     checked by the parser to a plain character set; the test command travels as
+#     base64 and is decoded inside the test job.
+#
+# WHY THESE JOBS. `container.image` and `services` are job-level keys, fixed before
+# any step runs, and the image is declared per repo. So `plan` (the stock runner image)
+# reads the file and the test job takes its image from plan's outputs. Postgres is a
+# service, and a service cannot be switched off, so there is one job with it (`test-pg`)
+# and one without (`test`); plan decides which runs. KEEP THE STEPS OF BOTH IDENTICAL
+# (test_ci_test.py checks). `result` is the one job to require: it is red unless plan
+# succeeded and exactly the right test job passed (a skipped job counts as passing for
+# branch protection, so requiring `test` alone could go green with `test-pg` red).
+# The declared image must carry node (the artifact action), tar and sh.
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+
+# One run per PR (or per branch) at a time; a newer push cancels the older run, which is
+# stale anyway. Tests are cheap to redo and nothing reports from here.
+concurrency:
+  group: test-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    # A push to any branch but the default one is skipped before anything starts.
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.plan.outputs.enabled }}
+      image: ${{ steps.plan.outputs.image }}
+      test_b64: ${{ steps.plan.outputs.test_b64 }}
+      workdir: ${{ steps.plan.outputs.workdir }}
+      timeout: ${{ steps.plan.outputs.timeout }}
+      postgres: ${{ steps.plan.outputs.postgres }}
+      pg_image: ${{ steps.plan.outputs.pg_image }}
+      pg_user: ${{ steps.plan.outputs.pg_user }}
+      pg_password: ${{ steps.plan.outputs.pg_password }}
+      pg_db: ${{ steps.plan.outputs.pg_db }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base branch must be present to read the parser from it.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read .forgejo/ci.toml (parser from the base branch)
+        id: plan
+        run: |
+          set -euo pipefail
+          parser="$RUNNER_TEMP/ci-test.py"
+          base=$(python3 -I -S -c 'import json,os;print((json.load(open(os.environ["GITHUB_EVENT_PATH"])).get("pull_request") or {}).get("base",{}).get("ref",""))')
+          base_toml=""
+          if [ -n "$base" ]; then
+            # A pull request: the parser, and the ci.toml the image and services come from,
+            # are both the base's.
+            if ! git show "origin/$base:.forgejo/ci-test.py" > "$parser" 2>/dev/null; then
+              echo "::warning::.forgejo/ci-test.py is not on origin/$base yet; nothing to test"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            base_toml="$RUNNER_TEMP/base-ci.toml"
+            git show "origin/$base:.forgejo/ci.toml" > "$base_toml" 2>/dev/null || rm -f "$base_toml"
+            if [ -f "$base_toml" ] && [ ! -f .forgejo/ci.toml ]; then
+              echo "::error::this PR deletes .forgejo/ci.toml, which origin/$base declares; restore it or remove it on the base first"
+              exit 1
+            fi
+          elif [ -f .forgejo/ci-test.py ]; then
+            # A push to the default branch: the commit is already merged code.
+            cp .forgejo/ci-test.py "$parser"
+          else
+            echo "::warning::.forgejo/ci-test.py is not in this commit; nothing to test"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A bad file exits non-zero here and fails the job; nothing is appended.
+          python3 -I -S "$parser" --file .forgejo/ci.toml ${base_toml:+--base-file "$base_toml"} > "$RUNNER_TEMP/plan.out"
+          cat "$RUNNER_TEMP/plan.out" >> "$GITHUB_OUTPUT"
+          grep -v '^test_b64=' "$RUNNER_TEMP/plan.out" || true
+      # The only checkout. The tree goes to the test job as one tar, without .git (a test
+      # needing history must fetch it itself, with no credentials).
+      - name: Pack the tree for the test job
+        if: steps.plan.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/src"
+          tar --exclude=./.git -czf "$RUNNER_TEMP/src/src.tgz" -C "$GITHUB_WORKSPACE" .
+      # forgejo/*-artifact, not actions/*: @actions/artifact v2 refuses non-github.com servers.
+      - name: Upload the tree
+        if: steps.plan.outputs.enabled == 'true'
+        uses: forgejo/upload-artifact@v4
+        with:
+          name: src
+          path: ${{ runner.temp }}/src/src.tgz
+          retention-days: 1
+          compression-level: 0
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.enabled == 'true' && needs.plan.outputs.postgres != 'true'
+    runs-on: ubuntu-latest
+    # Hard ceiling. The declared timeout_minutes (at most 30) is enforced by `timeout` below.
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.plan.outputs.image }}
+    steps:
+      - name: Download the tree
+        uses: forgejo/download-artifact@v4
+        # The artifact action needs ACTIONS_RUNTIME_TOKEN and nothing else.
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        with:
+          name: src
+          path: ${{ runner.temp }}/src
+      - name: Run the declared test command
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          TEST_B64: ${{ needs.plan.outputs.test_b64 }}
+          WORKDIR: ${{ needs.plan.outputs.workdir }}
+          TIMEOUT: ${{ needs.plan.outputs.timeout }}
+        run: |
+          set -euf
+          unset GITHUB_TOKEN FORGEJO_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          for w in $(export -p); do
+            n=${w%%=*}
+            case $n in ""|[0-9]*|*[!A-Za-z0-9_]*) ;; *[Tt][Oo][Kk][Ee][Nn]*) unset "$n" ;; esac
+          done
+          tar -xzf "$RUNNER_TEMP/src/src.tgz" -C "$GITHUB_WORKSPACE"
+          printf '%s' "$TEST_B64" | base64 -d > "$RUNNER_TEMP/ci-test.sh"
+          cd -- "$WORKDIR"
+          exec timeout -k 10 "${TIMEOUT}m" sh -e "$RUNNER_TEMP/ci-test.sh"
+
+  test-pg:
+    needs: plan
+    if: needs.plan.outputs.enabled == 'true' && needs.plan.outputs.postgres == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.plan.outputs.image }}
+    services:
+      # Reachable from the test command as host `postgres`, port 5432.
+      postgres:
+        image: ${{ needs.plan.outputs.pg_image }}
+        env:
+          POSTGRES_USER: ${{ needs.plan.outputs.pg_user }}
+          POSTGRES_PASSWORD: ${{ needs.plan.outputs.pg_password }}
+          POSTGRES_DB: ${{ needs.plan.outputs.pg_db }}
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - name: Download the tree
+        uses: forgejo/download-artifact@v4
+        # The artifact action needs ACTIONS_RUNTIME_TOKEN and nothing else.
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+        with:
+          name: src
+          path: ${{ runner.temp }}/src
+      - name: Run the declared test command
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""
+          TEST_B64: ${{ needs.plan.outputs.test_b64 }}
+          WORKDIR: ${{ needs.plan.outputs.workdir }}
+          TIMEOUT: ${{ needs.plan.outputs.timeout }}
+        run: |
+          set -euf
+          unset GITHUB_TOKEN FORGEJO_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          for w in $(export -p); do
+            n=${w%%=*}
+            case $n in ""|[0-9]*|*[!A-Za-z0-9_]*) ;; *[Tt][Oo][Kk][Ee][Nn]*) unset "$n" ;; esac
+          done
+          tar -xzf "$RUNNER_TEMP/src/src.tgz" -C "$GITHUB_WORKSPACE"
+          printf '%s' "$TEST_B64" | base64 -d > "$RUNNER_TEMP/ci-test.sh"
+          cd -- "$WORKDIR"
+          exec timeout -k 10 "${TIMEOUT}m" sh -e "$RUNNER_TEMP/ci-test.sh"
+
+  # The job to require. A skipped job passes branch protection, so this decides: plan
+  # must have succeeded, then either there was no ci.toml (neither test job ran) or exactly
+  # one test job ran and succeeded. No checkout, no token, nothing from the PR.
+  result:
+    needs: [plan, test, test-pg]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the right jobs to have passed
+        env:
+          EVENT: ${{ github.event_name }}
+          PLAN: ${{ needs.plan.result }}
+          ENABLED: ${{ needs.plan.outputs.enabled }}
+          TEST: ${{ needs.test.result }}
+          TEST_PG: ${{ needs.test-pg.result }}
+        run: |
+          echo "event=$EVENT plan=$PLAN enabled=$ENABLED test=$TEST test-pg=$TEST_PG"
+          fail() { echo "::error::ci-test: $*"; exit 1; }
+          if [ "$PLAN" = skipped ]; then
+            # plan skips only a push to a non-default branch
+            [ "$EVENT" = push ] && [ "$TEST" = skipped ] && [ "$TEST_PG" = skipped ] \
+              || fail "plan was skipped on a $EVENT, or a test job ran without it"
+            echo "branch push: nothing to test"; exit 0
+          fi
+          [ "$PLAN" = success ] || fail "plan $PLAN"
+          case "$ENABLED" in
+            false)
+              [ "$TEST" = skipped ] && [ "$TEST_PG" = skipped ] || fail "no ci.toml, but a test job ran"
+              echo "no ci.toml, nothing to test" ;;
+            true)
+              if [ "$TEST" = success ] && [ "$TEST_PG" = skipped ]; then echo "test passed"
+              elif [ "$TEST" = skipped ] && [ "$TEST_PG" = success ]; then echo "test-pg passed"
+              else fail "expected exactly one of test / test-pg to succeed"; fi ;;
+            *) fail "plan emitted enabled='$ENABLED'" ;;
+          esac

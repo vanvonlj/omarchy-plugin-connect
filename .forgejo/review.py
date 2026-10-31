@@ -80,6 +80,11 @@ CHUNK_FILES = 5
 MAX_CHUNKS = 12
 PARALLEL = 4
 CALL_TIMEOUT = 300
+# CNVYR-509: a part that failed (API error, an answer that is not JSON)
+# is tried once more after this many seconds. 2% of calls fail; one retry makes
+# a one-part diff's "no file reviewed" rare. A rate limit and a timeout are
+# never retried (a timeout usually repeats, and would double the worst case).
+RETRY_DELAY = 20
 # Guards against one bad run carpeting a PR. Anything past this goes in the
 # summary body as a list instead.
 MAX_INLINE = 25
@@ -268,7 +273,7 @@ def api(method, path, payload=None):
         "Content-Type": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosemgrep: python_urlopen_rule-urllib-urlopen -- url is the forge API base from the runner env + a fixed path, never PR text
             return json.loads(r.read() or "null")
     except urllib.error.HTTPError as e:
         body = redact(e.read()[:500].decode(errors="replace"))[0]
@@ -627,8 +632,10 @@ def ask_claude(prompt, label=""):
                 cwd=cwd, env=env)
     except subprocess.TimeoutExpired:
         print(f"{label}: claude timed out after {CALL_TIMEOUT}s", file=sys.stderr)
+        FAILED[label] = f"claude timed out after {CALL_TIMEOUT}s"
         return ""
     if p.returncode != 0:
+        FAILED[label] = f"claude exited {p.returncode}"
         # Redact, then cut: the other way round could split a secret in half.
         # `claude -p` prints API errors (expired OAuth token, 429, overloaded) on
         # STDOUT and leaves stderr empty, so log both (HLP-848).
@@ -642,16 +649,28 @@ def ask_claude(prompt, label=""):
 
 
 RATE_LIMITED = {}  # call label ("part 2/5") -> retry hint, per model call that hit the rate limit
+FAILED = {}  # call label -> why its latest try failed (CNVYR-509); gone once a try works
+
+
+MONTH = ("jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+         "sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?")
 
 
 def retry_hint(text):
     """When the limit resets, if the CLI said: `...limit reached|1760000000`
-    (epoch) or `... resets 3am`. Else a flat hour."""
+    (epoch), `... resets 3am (America/New_York)` or, for the weekly limit,
+    `... resets Oct 27, 9am (America/New_York)` (date and zone kept, CNVYR-472;
+    `Sept 27` and `September 27` read as `Sep 27`, CNVYR-488).
+    Else a flat hour."""
     m = re.search(r"\|(\d{10})\b", text)
     if m:
         return time.strftime("%H:%M UTC", time.gmtime(int(m.group(1))))
-    m = re.search(r"resets?\s+(?:at\s+)?([0-9][^\n.]{0,24})", text, re.I)
-    return m.group(1).strip() if m else "~1h"
+    m = re.search(r"resets?\s+(?:at\s+)?(?:(" + MONTH + r")\s+(\d{1,2},\s+))?([0-9][^\n.]{0,36})", text, re.I)
+    if not m:
+        return "~1h"
+    # CNVYR-488: `Sept`/`September` become `Sep`, so the hint stays short and
+    # the tick (rerun-review.ts) parses it.
+    return ((m.group(1)[:3].title() + " " + m.group(2)) if m.group(1) else "") + m.group(3).strip()
 
 
 def parse(out):
@@ -693,12 +712,17 @@ def legacy_fingerprint(f):
     return hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
-def already_raised(comments):
+def already_raised(comments, issue_comments=()):
     """(fingerprints of every finding posted before, highest F number used).
     Resolved or not: resolved means dealt with, unresolved means it is already
-    on screen. Neither wants saying twice."""
+    on screen. Neither wants saying twice. Findings in the bot's own fallback
+    plain comment count too (CNVYR-490), or the next run raises them inline
+    again under a new id; only the bot's, as with run markers."""
     seen, top = set(), 0
-    for c in comments:
+    fallbacks = [c for c in issue_comments
+                 if (c.get("user") or {}).get("login") == BOT
+                 and RUN.findall(c.get("body") or "") == ["fallback"]]
+    for c in [*comments, *fallbacks]:
         for fp, fid in FINDING.findall(c.get("body", "")):
             seen.add(fp)
             if fid:
@@ -911,10 +935,32 @@ def main():
     def review_part(k):
         c, t = todo[k], time.monotonic()
         files = "\n".join(f"  - {p}" + (" (part)" if p in split else "") for p in c["paths"])
-        result = parse(ask_claude(PROMPT.format(
+        label = f"part {k + 1}/{n}"
+        prompt = PROMPT.format(
             repo=repo, title=pr_title(), part=f"{k + 1} of {n}", checkout=os.getcwd(),
-            files=files, guidance=guidance_block, prior=prior, diff=c["diff"]),
-            f"part {k + 1}/{n}"))
+            files=files, guidance=guidance_block, prior=prior, diff=c["diff"])
+        for attempt in (1, 2):
+            FAILED.pop(label, None)
+            out = ask_claude(prompt, label)
+            result = parse(out)
+            if result:
+                break
+            if label not in FAILED:  # claude exited 0 with nothing usable
+                FAILED[label] = "claude answered but not with usable JSON"
+                # Redact, then cut, as for stderr. Bounded: a whole answer is
+                # long, and the log is read for the shape of the breakage.
+                print(f"{label}: unusable answer, stdout starts: "
+                      f"{redact(out)[0][:2000]!r}", file=sys.stderr)
+            if label in RATE_LIMITED:
+                print(f"{label}: rate-limited, not retrying", file=sys.stderr)
+                break
+            if FAILED[label].startswith("claude timed out"):
+                # A timeout usually repeats; a retry would double the worst case.
+                print(f"{label}: timed out, not retrying", file=sys.stderr)
+                break
+            if attempt == 1:
+                print(f"{label}: {FAILED[label]}, retrying in {RETRY_DELAY}s", file=sys.stderr)
+                time.sleep(RETRY_DELAY)
         print(f"part {k + 1}/{n}: {len(c['paths'])} file(s), {size(c['diff'])} B, "
               f"{time.monotonic() - t:.0f}s, {'ok' if result else 'NOT REVIEWED'}")
         return result
@@ -938,13 +984,18 @@ def main():
     if not any(results):
         # The CLI is down, out of quota or logged out: a review saying
         # "0/N reviewed" on every push would be noise, so one comment says so.
+        # CNVYR-509: say which part failed and why (the latest try of each), so
+        # the comment tells an outage from one malformed answer. Five at most.
+        why = sorted(FAILED.items(), key=lambda kv: (len(kv[0]), kv[0]))  # "part 2/12" before "part 10/12"
+        listed = "; ".join(f"{l}: {w}" for l, w in why[:5]) + (f"; and {len(why) - 5} more" if len(why) > 5 else "")
         return post_fallback(repo, pr, head,
                              "### Claude review\n\nNo part of the diff could be reviewed: "
-                             "every model call failed. See the job log.",
+                             f"every model call failed, each retried once unless rate-limited or timed out ({listed}). "
+                             "See the job log.",
                              "review failed: no file reviewed, see the job log")
 
     valid = anchors(diff)
-    seen, top = already_raised(comments)
+    seen, top = already_raised(comments, issue_comments)
     findings = [f for r in results if r for f in r.get("findings") or []
                 if isinstance(f, dict)
                 and all(isinstance(f.get(k), str) for k in ("path", "title", "body"))]

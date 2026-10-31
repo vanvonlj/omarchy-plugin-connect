@@ -1,0 +1,49 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-010 — `github.event.action` compared with GitHub's action names in a
+# workflow (CNVYR-482, from 2026-10-24: the first filter of #474's
+# claude-review.yml compared it with GitHub's names and let every label event
+# through; found by the CNVYR-460 red-team). `on: pull_request: types:` takes
+# GitHub's names and Forgejo translates them, but the payload's `action` keeps
+# Forgejo's own: `labeled` arrives as `label_updated`, `unlabeled` as
+# `label_cleared`, `synchronize` as `synchronized` (Forgejo
+# modules/actions/workflows.go for the `types:` side, services/actions/
+# notifier.go for the payload). So `== 'labeled'` is never true and
+# `!= 'synchronize'` is always true, with no error.
+# `types: [labeled]` is correct and not flagged: the rule looks only at a
+# comparison with the `action` field.
+#
+# Regex, not a YAML pattern: the comparison is as wrong in `if:` as inside any
+# `${{ }}` (env:, run:, concurrency.group, with:). Flags `==` or `!=` between
+# the action field and a quoted labeled / unlabeled / synchronize, either side
+# first, dot or bracket syntax (github.event['action']), any case (`==` ignores
+# case in an expression, so 'Labeled' is just as dead).
+# A line with a `#` before the comparison is skipped, so a YAML comment that
+# quotes the expression is quiet (a `#` inside a string literal earlier on the
+# same line hides it too: a miss).
+# Not covered: contains()/startsWith()/format() or a fromJSON list over the
+# action, an expression split over lines before the operator, a value bound
+# to a variable first (`env: A: ${{ github.event.action }}` and `$A` in a
+# script), and the `gitea` context alias.
+rules:
+- id: LJV-010
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    `github.event.action` compared with a GitHub action name that Forgejo never sends.
+
+    `types:` in `on:` takes GitHub's names, but the payload's action is Forgejo's
+    own, so this comparison never matches (`==` is always false, `!=` always
+    true) and no error says so. Use the Forgejo value: `label_updated` for
+    labeled, `label_cleared` for unlabeled, `synchronized` for synchronize.
+    Leave `types: [labeled, synchronize]` as it is.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-010-github-action-names-in-githubeventaction
+  metadata:
+    lesson: LJV-010
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-010-github-action-names-in-githubeventaction
+  pattern-regex: |-
+    (?imx)
+    ^ [^\#\n]*?
+    (?: \bgithub [.\[\]'"\s]+ event [.\[\]'"\s]+ action ['"\]\s]* (?:==|!=) \s* ['"] (?:labeled|unlabeled|synchronize) ['"]
+      | ['"] (?:labeled|unlabeled|synchronize) ['"] \s* (?:==|!=) \s* \bgithub [.\[\]'"\s]+ event [.\[\]'"\s]+ action (?![\w-]) )

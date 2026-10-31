@@ -11,7 +11,7 @@
 //
 // PR-body lint (CNVYR-412): fail a PR whose body lacks the facts Lucas reads first.
 //   node scripts/pr-body-lint.ts --event "$GITHUB_EVENT_PATH"        (CI)
-//   node scripts/pr-body-lint.ts [--repo R] [--title T] [--branch B] [--base main] [--files "a.md\nb.ts"] [body-file]
+//   node scripts/pr-body-lint.ts [--repo R] [--title T] [--branch B] [--base main] [--default-branch main] [--files "a.md\nb.ts"] [body-file]
 // --event reads body/title/head/base from the event JSON (PR text never passes through a
 // workflow expression: the runner would evaluate expressions inside it) and diffs the
 // changed files itself. Otherwise body from the file argument, else stdin.
@@ -21,9 +21,9 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-                                                                                                                   
+                                                                                                                                           
 
-const heading = (name        ) => new RegExp(`^#{1,6}[ \\t]*${name}\\b.*$`, "im");
+const heading = (name        ) => new RegExp(`^#{1,6}[ \\t]*${name}\\b.*$`, "im"); // nosemgrep: javascript_dos_rule-non-literal-regexp -- name is one of three hard-coded section names, never PR text
 /** The body's lines, each flagged true when it is a ``` or ~~~ fence line or sits inside a fence. */
 function fenceLines(body        )                                         {
   let fence                         = null; // the opening fence while inside one
@@ -96,7 +96,8 @@ export function dependencies(body        )           {
 }
 
 /** What is wrong with a PR body, one line each; "skip: <reason>" when the escape line applies. */
-export function lint({ body, repo = "", title = "", branch = "", base = "main", files = [] }    )                                           {
+export function lint({ body, repo = "", title = "", branch = "", base = "main", defaultBranch = "main", files = [] }    )                                           {
+  defaultBranch = defaultBranch.trim() || "main"; // an empty or blank value is absent, not a branch named "" (CNVYR-497)
   body = body.replace(/\r\n?/g, "\n"); // the Forgejo web editor saves CRLF; fence detection needs LF
   const claims = unfenced(body); // a line quoted in a code block is not a claim
   const skip = SKIP.exec(claims);
@@ -113,7 +114,8 @@ export function lint({ body, repo = "", title = "", branch = "", base = "main", 
   const hasDeps = dependencies(claims).length > 0;
   // A gitops PR is nearly always paired with one in another repo, so it always says which (or none).
   if (/(^|\/)gitops$/i.test(repo)) need(hasDeps || /^none\b/i.test(DEPENDS.exec(claims)?.[1] ?? ""), "Depends on: <repo#N, ...> or Depends on: none (gitops PRs always declare it)");
-  if (STACKED.test(claims) || base !== "main") need(hasDeps, `Depends on: <repo#N> (stacked PR${base !== "main" ? `, base is ${base}` : ""})`);
+  // Stacked = the base is not the repo's own default branch (master, develop, ...), not "not main" (CNVYR-497).
+  if (STACKED.test(claims) || base !== defaultBranch) need(hasDeps, `Depends on: <repo#N> (stacked PR${base !== defaultBranch ? `, base is ${base}` : ""})`);
   if (hasDeps) need(WHY.test(claims), "Why this order: <reason> (the PR has Depends on:)");
   if (/^fix\//.test(branch) || FIX_TITLE.test(title.trim())) {
     need(hasProof(body), 'a "fails without the fix" proof line (e.g. "the new test fails on main")');
@@ -127,7 +129,8 @@ export function fromEvent(path        , diff = changedFiles)     {
   const event = JSON.parse(readFileSync(path, "utf8"));
   const pr = event.pull_request ?? {};
   const base = String(pr.base?.ref ?? "main");
-  return { body: String(pr.body ?? ""), repo: String(event.repository?.full_name ?? ""), title: String(pr.title ?? ""), branch: String(pr.head?.ref ?? ""), base, files: diff(base) };
+  const defaultBranch = String(event.repository?.default_branch ?? "").trim() || "main"; // missing field: main, as before
+  return { body: String(pr.body ?? ""), repo: String(event.repository?.full_name ?? ""), title: String(pr.title ?? ""), branch: String(pr.head?.ref ?? ""), base, defaultBranch, files: diff(base) };
 }
 /** No diff (e.g. a shallow clone) → [], so the full lint applies, never the docs-only one. */
 export function changedFiles(base        )           {
@@ -155,6 +158,7 @@ function main(argv          )         {
     title: opt.title,
     branch: opt.branch,
     base: opt.base,
+    defaultBranch: opt["default-branch"],
     files: (opt.files ?? "").split(/[\n,]/).map((f) => f.trim()).filter(Boolean),
   });
   if (skipped !== undefined) console.log(`pr-body-lint: skipped (lint: skip) — ${skipped}`);

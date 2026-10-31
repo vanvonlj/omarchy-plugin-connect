@@ -1062,17 +1062,60 @@ def diff_lessons():
             if re.search(r"^\s+in_diff:\s*true\b", p.read_text(), re.M)]
 
 
+# opengrep's --timeout is per RULE per file (default 5 s) and a file is dropped
+# for every rule once --timeout-threshold (3) rules time out on it. Measured on
+# t3-code (CNVYR-530): at 5 s, 12-27 files were skipped, a different number each
+# run with the same commit; at 60 s none, no slower overall. 30 s still lost a
+# file in one of two runs. 0 (unbounded) is as fast but has no worst case. There
+# is no total-time budget in opengrep, so the CI job's own limit is the ceiling.
+SAST_TIMEOUT = 60
+
+
+def sast_timeouts(doc, root):
+    """Sorted root-relative paths opengrep gave up on, from its JSON `errors`.
+
+    Two shapes: a rule timing out (`type` "Timeout", or ["Timeout", ...]) and a
+    parse that hit the limit, which is NOT typed Timeout but `Other syntax error`
+    with `Memprof_limits.Limit_reached` in the message (that is how t3-code's
+    GitVcsDriverCore.ts was lost at 5 s). Either way the file got no findings."""
+    out = set()
+    for e in lst(doc, "errors"):
+        kind = e.get("type")
+        kind = kind[0] if isinstance(kind, list) and kind else kind
+        if kind == "Timeout" or "Limit_reached" in (e.get("message") or ""):
+            out.add(rel(e.get("path"), root))
+    return sorted(out)
+
+
+def sast_oversize(doc, root):
+    """Sorted root-relative paths opengrep dropped for `exceeded_size_limit`
+    (--max-target-bytes, 1 MB by default). They are in `paths.skipped`, which
+    opengrep fills only under --verbose (CNVYR-531); `errors` never mentions
+    them, so a generated or vendored big file was invisible."""
+    return sorted({rel(s.get("path"), root)
+                   for s in lst(doc.get("paths"), "skipped")
+                   if s.get("reason") == "exceeded_size_limit"})
+
+
 def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
+    """(findings, note, not_scanned): not_scanned is [(reason, path)], the
+    files opengrep timed out on ("timeout") or dropped for size ("size"). They
+    are not a coverage note (the rest of the layer ran) but a clean result does
+    not cover them, so main() prints each one and says so in the verdict."""
     # No --metrics flag: opengrep removed telemetry entirely and errors on it.
+    # --verbose, not --quiet (the two are mutually exclusive): only then does the
+    # JSON list the files skipped for size. The text log goes to a pipe, unread.
     cfgs = config if isinstance(config, (list, tuple)) else [config]
     cmd = [tools["opengrep"], "scan", *[a for c in cfgs for a in ("--config", str(c))],
-           "--taint-intrafile", "--quiet", "--json", "--output", str(out)]
+           "--taint-intrafile", "--verbose", "--json", "--output", str(out),
+           "--timeout", str(SAST_TIMEOUT)]
     if diff_ref:
         cmd += ["--baseline-commit", diff_ref]
     cmd.append(str(root))
     run(cmd)
+    doc = load_json(out)
     findings, created = [], None
-    for x in lst(load_json(out), "results"):
+    for x in lst(doc, "results"):
         extra = x.get("extra") or {}
         message = (extra.get("message") or "").strip()
         if (x.get("check_id") or "").endswith("LJV-005"):
@@ -1100,7 +1143,8 @@ def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
             # The rule's whole message: the title is only its first line, and
             # the how-to-fix is usually below it. Redacted in build_payload().
             message or None))
-    return findings, None
+    return findings, None, ([("timeout", p) for p in sast_timeouts(doc, root)]
+                            + [("size", p) for p in sast_oversize(doc, root)])
 
 
 # --------------------------------------------------------------------------
@@ -1641,6 +1685,7 @@ def main():
         canary(tools, layers, args.quiet)
 
     findings, notes, broken, partial = [], {}, [], {}
+    unscanned = []          # (layer, "timeout"|"size", path) opengrep skipped (CNVYR-530/531)
     nothing_to_check = False
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out.json"
@@ -1684,18 +1729,24 @@ def main():
             findings += f
             notes["iac"] = n
         if "sast" in layers:
-            f, n = scan_sast(tools, root, out, diff_ref)
+            f, n, skipped = scan_sast(tools, root, out, diff_ref)
             findings += f
             notes["sast"] = n
+            unscanned += [("sast", *s) for s in skipped]
         if "lessons" in layers:
-            f, n = scan_sast(tools, root, out, diff_ref, lesson_cfg, "lessons")
+            f, n, skipped = scan_sast(tools, root, out, diff_ref, lesson_cfg, "lessons")
             findings += f
             notes["lessons"] = n
+            unscanned += [("lessons", *s) for s in skipped]
 
     shown = {**notes, "deps": None} if nothing_to_check else notes
     print(report(findings, shown, layers, args.format, diff_ref, partial=partial))
     if nothing_to_check:
         print(f"\n{NOTHING_TO_CHECK}")
+    if unscanned:
+        print()
+        for layer, why, p in unscanned:
+            print(f"{layer}: not scanned ({why}): {redact(p)}")
 
     # ---- the gate ---------------------------------------------------------
     # Whole-tree runs gate NARROWLY. Secrets are binary, so any hit fails.
@@ -1752,11 +1803,16 @@ def main():
         print("FAILED: " + "; ".join(reasons) + ".")
         rc = 1
     else:
+        # Two different holes, so two clauses: a layer that covered nothing, and
+        # files a covered layer skipped. A clean result holds for the rest only.
+        holes = []
         if uncovered:
-            print(f"PASSED — but {', '.join(uncovered)} was not actually "
-                  "covered, see the note above.")
-        else:
-            print("PASSED.")
+            holes.append(f"{', '.join(uncovered)} was not actually covered, "
+                         "see the note above")
+        if unscanned:
+            holes.append(f"{len(unscanned)} file{'s' * (len(unscanned) > 1)} "
+                         "not scanned, listed above")
+        print(f"PASSED — but {' and '.join(holes)}." if holes else "PASSED.")
         rc = 0
 
     # The verdict is printed and rc is final. Reporting cannot change either.
