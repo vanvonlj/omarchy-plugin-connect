@@ -72,9 +72,6 @@ concurrency:
   group: test-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   plan:
     # A push to any branch but the default one is skipped before anything starts.

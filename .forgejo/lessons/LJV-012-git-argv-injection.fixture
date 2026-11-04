@@ -1,0 +1,132 @@
+// Fixture for LJV-012 (see LJV-001's fixture for the comment format; `//` here
+// because the fixture is TypeScript). The shapes are t3-code's, names changed.
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import * as cp from "node:child_process";
+import { execa } from "execa";
+
+export function unguarded(ref: string, remote: string, path: string, argv: string[]) {
+  // ruleid: LJV-012
+  spawn("git", ["fetch", "--quiet", remote]);
+  // ruleid: LJV-012
+  execFile("git", ["rev-parse", "--verify", `${ref}^{commit}`], () => {});
+  // ruleid: LJV-012
+  execFileSync("git", ["worktree", "remove", path]);
+  // ruleid: LJV-012
+  cp.spawnSync("git", ["log", ...argv]);
+  // ruleid: LJV-012
+  execa("git", ["remote", "get-url", remote]);
+  // ruleid: LJV-012
+  spawnSync("git", ["branch", ref], { cwd: "/repo" });
+  // A trailing `--` ends pathspecs after the ref; the ref is still an option:
+  // ruleid: LJV-012
+  spawn("git", ["checkout", ref, "--"]);
+  // `--` after the value does not help either:
+  // ruleid: LJV-012
+  spawn("git", ["fetch", remote, "--", "main"]);
+  // A member access and a call are not literals:
+  // ruleid: LJV-012
+  spawn("git", ["fetch", input.remote]);
+  // ruleid: LJV-012
+  spawn("git", ["fetch", String(remote)]);
+}
+
+export function guarded(ref: string, remote: string, argv: string[], dir: string) {
+  // ok: LJV-012
+  spawn("git", ["fetch", "--quiet", "--", remote]);
+  // ok: LJV-012
+  execFile("git", ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
+  // ok: LJV-012
+  cp.spawnSync("git", ["log", "--end-of-options", ...argv]);
+  // ok: LJV-012
+  spawn("git", ["status", "--porcelain=v1", "-z"]);
+  // ok: LJV-012
+  spawn("git", ["log", "-n", "5", "--format=%H"]);
+  // ok: LJV-012
+  spawn("git", [`status`, `--short`]);
+  // The value of -C and -c is that option's argument, not a ref:
+  // ok: LJV-012
+  spawn("git", ["-C", dir, "status"]);
+  // ok: LJV-012
+  spawn("git", ["-c", remote, "status"]);
+  // Not git:
+  // ok: LJV-012
+  spawn("echo", [ref]);
+  // ok: LJV-012
+  spawn("gh", ["pr", "view", ref]);
+  // An array held in a variable cannot be read (documented, not covered):
+  const args = ["fetch", remote];
+  // ok: LJV-012
+  spawn("git", args);
+}
+
+export function refused(ref: string) {
+  if (ref.startsWith("-")) throw new Error("ref starts with a dash");
+  // ok: LJV-012
+  spawn("git", ["rev-parse", ref]);
+}
+
+export function refusedBraced(ref: string) {
+  if (ref.startsWith("-")) {
+    console.warn("ref starts with a dash");
+    throw new Error("ref starts with a dash");
+  }
+  // ok: LJV-012
+  spawn("git", ["rev-parse", ref]);
+}
+
+export function checkedNotRefused(ref: string) {
+  if (ref.startsWith("-")) {
+    console.warn("ref starts with a dash");
+  }
+  // The check does not leave the function, so the dash still reaches git:
+  // ruleid: LJV-012
+  spawn("git", ["rev-parse", ref]);
+}
+
+export function refusedOneOfTwo(ref: string, other: string) {
+  if (!ref || ref.startsWith("-")) return;
+  // `other` is not guarded:
+  // ruleid: LJV-012
+  spawn("git", ["rev-parse", ref, other]);
+}
+
+// The repo's own helpers, as t3-code (executeGit, git.execute({ args })),
+// assistant and conveyor (git(dir, [...])) write them:
+declare function executeGit(op: string, cwd: string, args: string[], opts?: object): unknown;
+declare function runGit(cwd: string, args: string[]): unknown;
+declare function git(dir: string, args: string[]): unknown;
+declare const driver: { execute(input: { cwd: string; args: string[] }): unknown };
+
+export function helpers(cwd: string, ref: string, remote: string, base: string) {
+  // ruleid: LJV-012
+  executeGit("GitVcsDriver.remoteExists", cwd, ["remote", "get-url", remote], { timeoutMs: 1 });
+  // ruleid: LJV-012
+  runGit(cwd, ["worktree", "add", "-b", ref, base]);
+  // ruleid: LJV-012
+  git(cwd, ["diff", "--numstat", `${base}...${ref}`]);
+  // ruleid: LJV-012
+  driver.execute({ cwd, args: ["rev-parse", "--verify", `${ref}^{commit}`] });
+  // ok: LJV-012
+  executeGit("GitVcsDriver.deleteLocalBranch", cwd, ["branch", "-d", "--", ref]);
+  // ok: LJV-012
+  runGit(cwd, ["fetch", "--end-of-options", remote]);
+  // The author's own text before the value; a leading dash cannot come from the caller:
+  // ok: LJV-012
+  git(cwd, ["for-each-ref", `refs/remotes/${remote}/${ref}`]);
+  // ok: LJV-012
+  git(cwd, ["ls-files", `--with-tree=${ref}`, "-z"]);
+  // ok: LJV-012
+  driver.execute({ cwd, args: ["status", "--porcelain=v1", "-z"] });
+  // An args: property that is not git's (first element is no git subcommand):
+  // ok: LJV-012
+  other({ cwd, args: ["--flag", ref] });
+  // ok: LJV-012
+  other({ cwd, args: ["hello", ref] });
+}
+
+declare function other(input: object): unknown;
+
+export function dirOptions(gitDir: string, tree: string) {
+  // ok: LJV-012
+  spawn("git", ["--git-dir", gitDir, "--work-tree", tree, "status"]);
+}

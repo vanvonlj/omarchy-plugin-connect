@@ -1,0 +1,44 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-011 — a forgejo-runner / act config that hands the job containers a
+# Docker daemon's socket (CNVYR-524, from the CNVYR-510 red-team, fixed in
+# CNVYR-521). `container.docker_host` is the daemon the runner talks to AND the
+# socket it mounts into every job container; a `unix://` or `tcp://` value, or
+# `automount`, gives any workflow in any repo that runs on the pool that
+# daemon. If the daemon is privileged (rke2/forgejo/18- runs a
+# `docker:dind` sidecar with `privileged: true`), a job can start a container
+# with the host filesystem and has node root.
+#
+# Only the `docker_host` line is flagged, not the pairing with a
+# `privileged: true` daemon: opengrep scans one file at a time and the dind
+# sidecar is a different file from the runner config (17- vs 18-). A pool
+# whose daemon is unprivileged or rootless is a deliberate exception, kept with
+# `# nosemgrep: LJV-011` and the reason.
+# `docker_host: "-"` (mount nothing) and an empty value are not flagged. The
+# rule does not check that the key sits under `container:`; any YAML key named
+# `docker_host` with such a value is flagged (Ansible's community.docker
+# modules have one, with a legitimate meaning: suppress there).
+# Not covered: the `DOCKER_HOST` environment variable of a job or of the runner
+# container, and `container.options` / `valid_volumes` that mount the socket as
+# a plain bind mount (`/var/run/docker.sock`).
+rules:
+- id: LJV-011
+  languages: [yaml]
+  severity: WARNING
+  message: >-
+    Runner config gives job containers a Docker daemon's socket (`docker_host`).
+
+    The runner mounts this daemon's socket into every job container, so any
+    workflow that can run on the pool talks to it. If the daemon is privileged,
+    any job gets node root (CNVYR-521). Use `docker_host: "-"` (no socket) and
+    build images with a rootless builder, or point the pool at an unprivileged
+    (rootless) daemon. A pool that is isolated on purpose: keep it with
+    `# nosemgrep: LJV-011` and the reason.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-011-a-runner-config-that-gives-jobs-a-docker-daemons-socket
+  metadata:
+    lesson: LJV-011
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-011-a-runner-config-that-gives-jobs-a-docker-daemons-socket
+  # A line, not a YAML pattern: forgejo-runner's config sits inside a ConfigMap
+  # `data:` block scalar, which the YAML parser sees as one string.
+  pattern-regex: (?m)^[ \t]*docker_host[ \t]*:[ \t]*["']?(?:unix://|tcp://|automount\b)

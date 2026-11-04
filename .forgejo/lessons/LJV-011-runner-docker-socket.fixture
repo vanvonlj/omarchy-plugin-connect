@@ -1,0 +1,54 @@
+# Fixture for LJV-011 (see LJV-001's fixture for the comment format).
+# A runner config on its own, and the same inside a ConfigMap block scalar:
+container:
+  # ruleid: LJV-011
+  docker_host: "unix:///dind/docker.sock"
+---
+container:
+  # ruleid: LJV-011
+  docker_host: unix:///var/run/docker.sock
+---
+container:
+  # ruleid: LJV-011
+  docker_host: 'tcp://127.0.0.1:2375'
+---
+container:
+  # ruleid: LJV-011
+  docker_host: automount
+---
+container:
+  # ruleid: LJV-011
+  docker_host: "automount"
+---
+kind: ConfigMap
+data:
+  config.yml: |
+    container:
+      # ruleid: LJV-011
+      docker_host: "unix:///dind/docker.sock"
+      privileged: false
+---
+container:
+  # No socket in the job containers:
+  # ok: LJV-011
+  docker_host: "-"
+---
+container:
+  # ok: LJV-011
+  docker_host: ""
+---
+container:
+  # ok: LJV-011
+  docker_host: '-'
+---
+container:
+  # ok: LJV-011
+  privileged: false
+  # docker_host: "unix:///dind/docker.sock" is the old setting, kept as a comment
+  # ok: LJV-011
+  force_pull: false
+---
+container:
+  # Another key that merely contains the name:
+  # ok: LJV-011
+  not_docker_host: "unix:///dind/docker.sock"

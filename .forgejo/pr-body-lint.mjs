@@ -3,15 +3,16 @@
 // (synced here as .forgejo/pr-body-lint.mjs by rollout.py; a local edit is drift).
 //
 // Vendored from lukejv-dev/assistant scripts/pr-body-lint.ts
-//   commit 8d749f03a7f8b3fe4d63d41443be43b7e8ed8730 (blob 57d84514a992658a89f75d2235d09c02a9881b66)
+//   commit d532093bdeb5815249066ab146997e25f0e561c6 (blob c01ecfbdd3ad63734404b48d1e2feed27738b184)
 // Only the TypeScript types are removed (node:module stripTypeScriptTypes, mode "strip":
 // same lines, same columns) and `import.meta.main` (Node >= 24.2 only) becomes an
 // argv[1] check, so it runs on any Node >= 18 with no install. Logic is unchanged.
 // To update: re-vendor from assistant, bump the commit above, rerun test_pr_body.py.
+// The two usage lines below name this file's synced path; the .ts has scripts/pr-body-lint.ts there.
 //
 // PR-body lint (CNVYR-412): fail a PR whose body lacks the facts Lucas reads first.
-//   node scripts/pr-body-lint.ts --event "$GITHUB_EVENT_PATH"        (CI)
-//   node scripts/pr-body-lint.ts [--repo R] [--title T] [--branch B] [--base main] [--default-branch main] [--files "a.md\nb.ts"] [body-file]
+//   node .forgejo/pr-body-lint.mjs --event "$GITHUB_EVENT_PATH"        (CI)
+//   node .forgejo/pr-body-lint.mjs [--repo R] [--title T] [--branch B] [--base main] [--default-branch main] [--files "a.md\nb.ts"] [body-file]
 // --event reads body/title/head/base from the event JSON (PR text never passes through a
 // workflow expression: the runner would evaluate expressions inside it) and diffs the
 // changed files itself. Otherwise body from the file argument, else stdin.
@@ -102,6 +103,8 @@ export function lint({ body, repo = "", title = "", branch = "", base = "main", 
   const claims = unfenced(body); // a line quoted in a code block is not a claim
   const skip = SKIP.exec(claims);
   const problems           = [];
+  // Renovate writes and rewrites its own body (a hand edit is lost on its next rebase), so a branch it owns is exempt.
+  if (/^renovate\//.test(branch)) return { problems: [], skipped: "Renovate-generated PR (renovate/* branch)" };
   if (skip && /\w/.test(skip[1])) return { problems: [], skipped: skip[1].trim() };
   if (skip) problems.push("`lint: skip` needs a reason (e.g. `lint: skip generated rollout PR`)");
   const need = (ok         , what        ) => ok || problems.push(what);

@@ -1,0 +1,152 @@
+# MANAGED FILE — do not edit in this repository.
+# Source of truth: lukejv-dev/homelab-platform → ops/forgejo-ci/files/lessons/
+#
+# LJV-012 — a git child process whose argv has a value the code did not write,
+# with nothing before it that ends git's option parsing (CNVYR-525, from the
+# t3-code audits CNVYR-520 and CNVYR-522: eight places where a ref, remote, path
+# or URL such as `--upload-pack=<cmd>` reached git as an option; `fetch`,
+# `ls-remote` and `clone` run that command, `--output=<file>` writes a file,
+# and a worktree path of `--force` forces the removal). `execFile`-style calls
+# have no shell, so this is not shell injection: git itself reads the leading
+# dash. The fix is `--end-of-options` (git 2.24+) or `--` before the value, or
+# refusing a value that starts with `-`. A trailing `--` after the value, as in
+# `checkout <ref> --`, does not help.
+#
+# Flagged: an argv array literal that holds an element which is not a plain
+# string literal (a variable, member access, call, template that starts with
+# `${`, or a spread), when no `"--end-of-options"` or `"--"` element comes
+# earlier in the same array, in one of three places:
+#   1. spawn / spawnSync / execFile / execFileSync / execa / execaSync (bare or
+#      `cp.spawn`) called with the literal `"git"`;
+#   2. the repo's own git helper, by name: git, runGit, executeGit, gitRun,
+#      tryGit, with the array as the 1st, 2nd or 3rd argument (t3-code's
+#      `executeGit(op, cwd, [...])`, assistant's and conveyor's `git(dir, [...])`);
+#   3. an object property `args: [...]` whose first element is a git
+#      subcommand string (t3-code's `git.execute({ args: ["fetch", ...] })`).
+# One finding per call or property, at its first line. A template that starts
+# with literal text (`--with-tree=${x}`, `refs/heads/${x}`) is quiet: the dash
+# there is the author's.
+# Quiet: the value after a literal `-C`, `-c`, `--git-dir` or `--work-tree` (git
+# takes it as the option's value); a value in a block after `if (<…> v.startsWith("-"))`
+# for that same variable whose body ends in `throw` or `return`, which is the only
+# shape of the leading-dash guard the pattern can see (an `if` that only logs does
+# not silence it) (an `ensureGitCommand`-style helper that throws is not visible to a
+# one-file rule: suppress those with `// nosemgrep: LJV-012` and say which
+# helper guards it). Test files (*.test.*, *.spec.*, test/, tests/,
+# __tests__/) are skipped.
+# Not covered: an array held in a variable (`spawn("git", args)`), a command
+# held in a variable, `exec("git " + …)` (that is the shell-injection rule
+# lukejv_js_cmdi_*), a helper under another name, Effect's
+# `ChildProcess.make("git", …)`, an array built over several statements
+# (`args.push(ref)`), and Python or other languages. The helper names are a
+# list, not a type check: a generic `$G(..., [...], ...)` callee pattern made
+# opengrep time out on t3-code's 4,100-line GitVcsDriverCore.ts.
+#
+# Cost: the array is bound as $ARR and read on its own. Matching `[..., $A, ...]`
+# across the whole file took 4 s of match time on that file; this takes 0.2 s.
+rules:
+- id: LJV-012
+  languages: [javascript, typescript]
+  severity: WARNING
+  # Test code builds throwaway repos from variables; it is not a trust boundary.
+  paths:
+    exclude: ["*.test.*", "*.spec.*", "test", "tests", "__tests__"]
+  message: >-
+    A git command takes a value as an argument with no `--end-of-options` or `--` before it.
+
+    A ref, remote, URL or path that starts with `-` is read by git as an option
+    (`--upload-pack=<command>` runs that command on fetch; `--output=<file>`
+    writes a file). Put `"--end-of-options"` (git 2.24+) or `"--"` in the argv
+    before the value, or refuse a value that starts with `-` first. A `--` after
+    the value does not help. A value that is guarded elsewhere: keep it with
+    `// nosemgrep: LJV-012` and name the guard. See CNVYR-520.
+    Docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-012-a-git-command-whose-argument-is-read-as-an-option
+  metadata:
+    lesson: LJV-012
+    docs: https://docs.lukejv.com/architecture/anti-patterns/#ljv-012-a-git-command-whose-argument-is-read-as-an-option
+  patterns:
+    - pattern-either:
+        # 1. spawn("git", [...])
+        - patterns:
+            - pattern: $FN("git", $ARR, ...)
+            - metavariable-regex:
+                metavariable: $FN
+                regex: ^(?:.*\.)?(?:spawn|spawnSync|execFile|execFileSync|execa|execaSync)$
+            - metavariable-pattern:
+                metavariable: $ARR
+                patterns:
+                  - pattern: "[..., $A, ...]"
+                  # Not a plain string: "x", 'x', or a template that starts with text.
+                  - metavariable-regex:
+                      metavariable: $A
+                      regex: (?s)^(?!"|')(?!`[^$])
+                  - pattern-not: "[..., '--end-of-options', ..., $A, ...]"
+                  - pattern-not: "[..., '--', ..., $A, ...]"
+                  # The value of -C / -c / --git-dir / --work-tree is that option's argument:
+                  - pattern-not: "[..., '-C', $A, ...]"
+                  - pattern-not: "[..., '-c', $A, ...]"
+                  - pattern-not: "[..., '--git-dir', $A, ...]"
+                  - pattern-not: "[..., '--work-tree', $A, ...]"
+        # 2. the repo's own helper: runGit(cwd, [...]), executeGit(op, cwd, [...])
+        - patterns:
+            - pattern-either:
+                - pattern: git($ARR, ...)
+                - pattern: git($X, $ARR, ...)
+                - pattern: git($X, $Y, $ARR, ...)
+                - pattern: runGit($ARR, ...)
+                - pattern: runGit($X, $ARR, ...)
+                - pattern: runGit($X, $Y, $ARR, ...)
+                - pattern: executeGit($ARR, ...)
+                - pattern: executeGit($X, $ARR, ...)
+                - pattern: executeGit($X, $Y, $ARR, ...)
+                - pattern: gitRun($ARR, ...)
+                - pattern: gitRun($X, $ARR, ...)
+                - pattern: gitRun($X, $Y, $ARR, ...)
+                - pattern: tryGit($ARR, ...)
+                - pattern: tryGit($X, $ARR, ...)
+                - pattern: tryGit($X, $Y, $ARR, ...)
+            - metavariable-pattern:
+                metavariable: $ARR
+                patterns:
+                  - pattern: "[..., $A, ...]"
+                  - metavariable-regex:
+                      metavariable: $A
+                      regex: (?s)^(?!"|')(?!`[^$])
+                  - pattern-not: "[..., '--end-of-options', ..., $A, ...]"
+                  - pattern-not: "[..., '--', ..., $A, ...]"
+                  - pattern-not: "[..., '-C', $A, ...]"
+                  - pattern-not: "[..., '-c', $A, ...]"
+                  - pattern-not: "[..., '--git-dir', $A, ...]"
+                  - pattern-not: "[..., '--work-tree', $A, ...]"
+        # 3. { args: ["fetch", ...] }, as in git.execute({ cwd, args: [...] })
+        - patterns:
+            - pattern: "{..., args: $ARR, ...}"
+            - metavariable-pattern:
+                metavariable: $ARR
+                patterns:
+                  - pattern: "[$CMD, ..., $A, ...]"
+                  - metavariable-regex:
+                      metavariable: $CMD
+                      regex: ^["'](?:fetch|pull|push|clone|ls-remote|remote|rev-parse|rev-list|log|diff|show|merge-base|merge|reset|checkout|switch|branch|worktree|config|status|tag|for-each-ref|show-ref|cherry-pick|rebase|restore|cat-file|ls-files|ls-tree|symbolic-ref|update-ref)["']$
+                  - metavariable-regex:
+                      metavariable: $A
+                      regex: (?s)^(?!"|')(?!`[^$])
+                  - pattern-not: "[..., '--end-of-options', ..., $A, ...]"
+                  - pattern-not: "[..., '--', ..., $A, ...]"
+                  - pattern-not: "[..., '-C', $A, ...]"
+                  - pattern-not: "[..., '-c', $A, ...]"
+                  - pattern-not: "[..., '--git-dir', $A, ...]"
+                  - pattern-not: "[..., '--work-tree', $A, ...]"
+    # A leading-dash guard earlier in the block that leaves it: if (<… v.startsWith("-") …>) { …; throw/return … }
+    - pattern-not-inside: |
+        if (<... $A.startsWith("-") ...>) { ... throw ...; }
+        ...
+    - pattern-not-inside: |
+        if (<... $A.startsWith("-") ...>) { ... return ...; }
+        ...
+    - pattern-not-inside: |
+        if (<... $A.startsWith("-") ...>) throw ...;
+        ...
+    - pattern-not-inside: |
+        if (<... $A.startsWith("-") ...>) return ...;
+        ...

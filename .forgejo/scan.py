@@ -164,6 +164,8 @@ def run(cmd, **kw):
     """Run a command, never raising. Returns (rc, stdout, stderr)."""
     kw.setdefault("capture_output", True)
     kw.setdefault("text", True)
+    if kw["text"]:      # a tool's stderr is not always UTF-8; never crash decoding it
+        kw.setdefault("errors", "replace")
     try:
         p = subprocess.run(cmd, **kw)
         return p.returncode, p.stdout or "", p.stderr or ""
@@ -322,16 +324,21 @@ def canary_lessons(tools, tmp):
             problems.append(f"{rule.name} has no {fixture.name}")
             continue
         text = fixture.read_text()
-        (fx / f"{rule.stem}.yaml").write_text(text)
+        # The fixture is scanned as the rule's own language: a JS/TS rule only
+        # matches a .ts file, and its marker comments are `//` (CNVYR-525).
+        lang = re.search(r"^\s*languages:\s*\[\s*(\w+)", rule.read_text(), re.M)
+        code = lang and lang[1] in ("javascript", "typescript")
+        (fx / f"{rule.stem}.{'ts' if code else 'yaml'}").write_text(text)
+        marker = r"(?:#|//)" if code else "#"
         marks = {"ruleid": set(), "ok": set()}
         for n, line in enumerate(text.splitlines(), 1):
-            m = re.search(r"#\s*(ruleid|ok):\s*(\S+)", line)
+            m = re.search(marker + r"\s*(ruleid|ok):\s*(\S+)", line)
             if m:
                 marks[m[1]].add((rule.stem, n + 1, m[2]))
         rid = "-".join(rule.stem.split("-")[:2])        # LJV-001-slug -> LJV-001
         for kind, found in marks.items():
             if not any(r == rid for _, _, r in found):
-                problems.append(f"{fixture.name} has no `# {kind}: {rid}` line")
+                problems.append(f"{fixture.name} has no `# {kind}: {rid}` (or `// …`) line")
         want |= marks["ruleid"]
         ok |= marks["ok"]
     out = tmp / "lessons.json"
@@ -599,20 +606,70 @@ def osv_source_scan(tools, root, out, extra=()):
     return findings, sources
 
 
+def find_files(root, name):
+    """Sorted relative paths of every file called `name` under root.
+
+    A plain walk that skips .git, node_modules and a top-level `vendor/`.
+    ponytail: not gitignore-aware; swap for `git ls-files -co` if a vendored
+    tree ever makes that noisy.
+    """
+    found = []
+    for d, dirs, files in os.walk(root):
+        skip = (".git", "node_modules") + (("vendor",) if Path(d) == Path(root) else ())
+        dirs[:] = [x for x in dirs if x not in skip]
+        if name in files:
+            found.append(rel(Path(d) / name, root))
+    return sorted(found)
+
+
 def misnamed_osv_configs(root):
     """Paths of `.osv-scanner.toml` files under root (SCAN-264).
 
     osv-scanner reads only `osv-scanner.toml`; a dotted file is silently ignored,
-    so the suppression it was written for never applies. ponytail: a plain walk
-    that skips .git and node_modules, not gitignore-aware; swap for
-    `git ls-files -co` if a vendored tree ever makes that noisy.
+    so the suppression it was written for never applies.
     """
-    found = []
-    for d, dirs, files in os.walk(root):
-        dirs[:] = [x for x in dirs if x not in (".git", "node_modules")]
-        if ".osv-scanner.toml" in files:
-            found.append(rel(Path(d) / ".osv-scanner.toml", root))
-    return sorted(found)
+    return find_files(root, ".osv-scanner.toml")
+
+
+EXPIRY_WARN_DAYS = 14
+
+
+def expiring_suppressions(root):
+    """Warning lines for `[[IgnoredVulns]]` whose ignoreUntil is <= 14 days away (SCAN-290).
+
+    The day a suppression lapses the gate goes red with no hint, so name it
+    early. Non-gating: the caller only prints, so nothing in here may raise. A
+    toml that will not parse, or whose IgnoredVulns has the wrong shape, gets one
+    warning of its own, because its suppressions are unreadable. A naive
+    datetime counts as UTC.
+    """
+    today = datetime.now(timezone.utc).date()
+    lines = []
+    for p in find_files(root, "osv-scanner.toml"):
+        try:
+            data = tomllib.loads((Path(root) / p).read_text())
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            lines.append(f"warning: deps: {p} is unreadable ({type(e).__name__}); "
+                         "its suppression expiry dates were not checked")
+            continue
+        try:
+            found = []
+            for v in lst(data, "IgnoredVulns"):
+                until = v.get("ignoreUntil") if isinstance(v, dict) else None
+                if isinstance(until, datetime):
+                    until = (until.astimezone(timezone.utc) if until.tzinfo else until).date()
+                if not hasattr(until, "year"):
+                    continue
+                days = (until - today).days
+                if days <= EXPIRY_WARN_DAYS:
+                    when = f"expired {-days} days ago" if days < 0 else f"expires in {days} days"
+                    found.append(f"warning: deps: {p}: {v.get('id', '?')} ignoreUntil {until} "
+                                 f"{when}; re-check it or the gate goes red")
+            lines += found
+        except Exception as e:   # a warning pass never gates: `IgnoredVulns = 5`, a year-1 date
+            lines.append(f"warning: deps: {p} has a malformed IgnoredVulns ({type(e).__name__}); "
+                         "its suppression expiry dates were not checked")
+    return lines
 
 
 def scan_deps(tools, root, out):
@@ -1356,19 +1413,33 @@ def note_lines(gaps):
 
     A bad character becomes `?`, never nothing, so it cannot join two halves
     of a key; the cap comes after redact() for the reason remediation's does."""
-    out = []
-    for p, why in gaps:
-        s = redact(_NOTE_BAD.sub("?", f"{p}: {why}"))[:NOTE_MAX]
-        while len(s.encode("utf-16-le")) > 2 * NOTE_MAX:   # astral = 2 units
-            s = s[:-1]
-        out.append(s)
+    out = [_fit(f"{p}: {why}") for p, why in gaps]
     if len(out) > NOTE_LINES_MAX:
         out[NOTE_LINES_MAX - 1:] = [f"… {len(out) - NOTE_LINES_MAX + 1} more"]
     return out
 
 
+def _fit(s):
+    """`s` as one console line: no bad characters, redacted, 300 UTF-16 units."""
+    s = redact(_NOTE_BAD.sub("?", s))[:NOTE_MAX]
+    while len(s.encode("utf-16-le")) > 2 * NOTE_MAX:   # astral = 2 units
+        s = s[:-1]
+    return s
+
+
+def not_scanned(unscanned, layers):
+    """[(layer, reason, path)] as the console's `notScanned` entries (CNVYR-546).
+
+    Only layers the console tracks and this run covered: `lessons` is not one,
+    so a file only the lessons pass skipped is printed above but not sent. The
+    501st entry is a 400 for the whole report, so the list stops at 500
+    (ponytail: the count shown then understates; raise it with the console's cap)."""
+    return [{"path": _fit(p), "reason": why, "layer": layer}
+            for layer, why, p in unscanned if layer in layers][:NOTE_LINES_MAX]
+
+
 def build_payload(target, started_at, rc, layers, findings, notes, canaried,
-                  head=None, partial=None):
+                  head=None, partial=None, unscanned=()):
     """The console's ReportScanRequest, and nothing else: it rejects unknown
     fields (JsonUnmappedMemberHandling.Disallow), so an extra key is a 400.
 
@@ -1380,8 +1451,16 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried,
 
     `notes` on the wire is `partial` — what a layer could not check (SCAN-147)
     — not the coverage notes above, and it never touches `layers`. An empty
-    list says "checked, nothing to note"; an absent layer says nothing. The console accepts it from scan-console#72."""
+    list says "checked, nothing to note"; an absent layer says nothing. The console accepts it from scan-console#72.
+
+    `notScanned` (CNVYR-546) is the files a covered layer skipped, as
+    {path, reason: timeout|size, layer}. Sent only when there are some, and only
+    a console that has the field accepts it: an older one 400s the whole report
+    on the unknown key (Disallow, above), so the console is deployed first, and
+    a repo that skipped nothing sends the same body as before. It changes
+    neither `layers` nor the verdict."""
     layers = [l for l in layers if l in CONSOLE_LAYERS]
+    skipped = not_scanned(unscanned, layers)
     findings = [f for f in findings if f.layer in CONSOLE_LAYERS]
     # An empty list claims "checked, nothing to note", so a layer that did not
     # cover anything (its coverage note is set) sends one only with lines.
@@ -1413,6 +1492,7 @@ def build_payload(target, started_at, rc, layers, findings, notes, canaried,
         "toolVersions": {NEEDS[l]: VERSIONS[NEEDS[l]] for l in layers},
         "findings": out,
         **({"notes": sent} if sent else {}),
+        **({"notScanned": skipped} if skipped else {}),
         **(head or {}),
     }
 
@@ -1479,7 +1559,7 @@ def _why(e):
 
 
 def report_to_console(args, root, layers, findings, notes, rc, started_at,
-                      canaried, partial=None):
+                      canaried, partial=None, unscanned=()):
     """Report this run to scan-console. Never raises, never touches rc; every
     way it can go wrong is exactly one line on stderr.
 
@@ -1535,7 +1615,7 @@ def report_to_console(args, root, layers, findings, notes, rc, started_at,
                  "(no usable `origin` remote to derive it from). Not reported")
             return
         payload = build_payload(target, started_at, rc, layers, findings,
-                                notes, canaried, git_head(root), partial)
+                                notes, canaried, git_head(root), partial, unscanned)
         _, doc = post_report(base.rstrip("/") + "/scans/reported", token,
                              payload, REPORT_TIMEOUT)
     except Exception as e:
@@ -1685,6 +1765,16 @@ def main():
         canary(tools, layers, args.quiet)
 
     findings, notes, broken, partial = [], {}, [], {}
+
+    def guarded(layer, fn, *a):
+        """A layer that raises did not run: fail the gate, never skip it (HLP-876)."""
+        try:
+            return fn(*a)
+        except Exception as e:
+            sys.stderr.write(f"error: the {layer} layer crashed — "
+                             f"{redact(f'{type(e).__name__}: {e}')}\n")
+            broken.append(layer)
+            return None
     unscanned = []          # (layer, "timeout"|"size", path) opengrep skipped (CNVYR-530/531)
     nothing_to_check = False
     with tempfile.TemporaryDirectory() as tmp:
@@ -1695,20 +1785,29 @@ def main():
             except LayerError as e:
                 f, n = [], f"the secrets layer did NOT run — {e}"
                 broken.append("secrets")
+            except Exception as e:      # any other crash fails the gate too (HLP-876)
+                sys.stderr.write("error: the secrets layer crashed — "
+                                 f"{redact(f'{type(e).__name__}: {e}')}\n")
+                f, n = [], "the secrets layer did NOT run — it crashed"
+                broken.append("secrets")
             findings += f
             notes["secrets"] = n
         if "deps" in layers:
             for p in misnamed_osv_configs(root):
                 sys.stderr.write(f"warning: deps: {p} is named .osv-scanner.toml, "
                                  "osv-scanner ignores it; rename to osv-scanner.toml\n")
-            f, n = scan_deps(tools, root, out)
+            for w in expiring_suppressions(root):
+                sys.stderr.write(w + "\n")
+            r = guarded("deps", scan_deps, tools, root, out)
+            f, n = r if r else ([], "the deps layer did NOT run")
             findings += f
             notes["deps"] = n
             # Its own channel, never notes: a note turns the layer off. Sent to
             # the console as `notes` (SCAN-147), which change no coverage.
-            # The catch covers the listing only; scan_deps above stays
-            # unguarded. Either failure leaves `partial` without deps, so the
-            # console reads "didn't say", and the scan still reaches its gate.
+            # The catch covers the listing only; a scan_deps crash is recorded
+            # in `broken` by guarded() above. Either failure leaves `partial`
+            # without deps, so the console reads "didn't say", and the scan
+            # still reaches its gate.
             try:
                 m, why = uncovered_manifests(root), "git ls-files failed"
             except Exception as e:
@@ -1725,16 +1824,19 @@ def main():
                 # finding.
                 nothing_to_check = bool(n) and not has_manifest(root)
         if "iac" in layers:
-            f, n, partial["iac"] = scan_iac(tools, root, out, diff_ref)
+            r = guarded("iac", scan_iac, tools, root, out, diff_ref)
+            f, n, partial["iac"] = r if r else ([], "the iac layer did NOT run", None)
             findings += f
             notes["iac"] = n
         if "sast" in layers:
-            f, n, skipped = scan_sast(tools, root, out, diff_ref)
+            r = guarded("sast", scan_sast, tools, root, out, diff_ref)
+            f, n, skipped = r if r else ([], "the sast layer did NOT run", [])
             findings += f
             notes["sast"] = n
             unscanned += [("sast", *s) for s in skipped]
         if "lessons" in layers:
-            f, n, skipped = scan_sast(tools, root, out, diff_ref, lesson_cfg, "lessons")
+            r = guarded("lessons", scan_sast, tools, root, out, diff_ref, lesson_cfg, "lessons")
+            f, n, skipped = r if r else ([], "the lessons layer did NOT run", [])
             findings += f
             notes["lessons"] = n
             unscanned += [("lessons", *s) for s in skipped]
@@ -1820,7 +1922,8 @@ def main():
     # unverified, and a layer the console believes ran resolves findings.
     sys.stdout.flush()
     report_to_console(args, root, layers, findings, notes, rc, started_at,
-                      canaried=not args.no_canary, partial=partial)
+                      canaried=not args.no_canary, partial=partial,
+                      unscanned=unscanned)
     return rc
 
 
