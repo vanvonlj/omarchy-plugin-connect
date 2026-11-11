@@ -64,7 +64,11 @@ name: ci-test
 "on":
   pull_request:
     types: [opened, synchronize, reopened]
+  # Default branches only (HLP-1141): a push to a PR branch is tested by the pull_request run, so the
+  # branch push was a second run of the same commit (about 1,150 runs a week). Every default branch
+  # name in use is listed; a repo whose default branch is none of these gets no push run (add its name).
   push:
+    branches: [main, master, develop, homelab, exec-plugin]
 
 # One run per PR (or per branch) at a time; a newer push cancels the older run, which is
 # stale anyway. Tests are cheap to redo and nothing reports from here.

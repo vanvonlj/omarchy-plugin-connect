@@ -1154,6 +1154,190 @@ def sast_oversize(doc, root):
                    if s.get("reason") == "exceeded_size_limit"})
 
 
+# LJV-013 (CNVYR-544). Forgejo reads only the first of .forgejo/.gitea/.github
+# workflows, so once the managed sync adds .forgejo/workflows a repo's
+# .github/workflows stop running there (12 repos lost their image builds that way
+# on 2026-10-03, CNVYR-523). opengrep sees one file, not two directories, so this
+# is a Python check that runs with the lessons layer.
+LJV013_DOCS = ("https://docs.lukejv.com/architecture/anti-patterns/"
+               "#ljv-013-a-github-workflow-forgejo-never-runs")
+LJV013_OPT_OUT = re.compile(r"^[ \t]*#[ \t]*ljv-013:[ \t]*github-mirror-only[ \t]+\S", re.M | re.I)
+LJV013_MESSAGE = (
+    "{f} never runs on Forgejo: .forgejo/workflows exists, and Forgejo reads only that "
+    "directory.\n\n"
+    "Port it to .forgejo/workflows (same file name, or a job of the same name), or, if it is "
+    "CI for a live GitHub mirror, add the line `# ljv-013: github-mirror-only <reason>` to "
+    "the file. Why: since the managed-CI sync on 2026-10-03 a repo's only build recipe could "
+    "sit in .github/workflows and stop running with nothing red (CNVYR-523).\n\n"
+    "Docs: " + LJV013_DOCS)
+
+
+def job_names(text):
+    """The job keys under a workflow's top-level `jobs:`. ponytail: line-based, so a
+    flow-style `jobs: {a: ...}` yields none (the file then matches by name only)."""
+    names, indent, in_jobs = set(), None, False
+    for line in text.splitlines():
+        if re.match(r"jobs:[ \t]*(#.*)?$", line):
+            in_jobs = True
+        elif not in_jobs or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        elif not line[0].isspace():
+            break
+        else:
+            here = len(line) - len(line.lstrip())
+            indent = here if indent is None else indent
+            m = here == indent and re.match(r"\s+[\"']?([\w-]+)[\"']?:", line)
+            if m:
+                names.add(m.group(1))
+    return names
+
+
+def github_only_workflows(root):
+    """LJV-013 findings: each .github/workflows file with no counterpart (same file
+    name, or all its jobs present by name) in .forgejo/workflows or .gitea/workflows.
+    Nothing when either side is absent, and nothing for a file that opts out."""
+    root = Path(root)
+    gh = root / ".github" / "workflows"
+    forge = [d for d in (root / ".forgejo" / "workflows", root / ".gitea" / "workflows")
+             if d.is_dir()]
+    if not forge or not gh.is_dir():
+        return []
+
+    def workflows(d):
+        return sorted(p for p in d.iterdir() if p.suffix in (".yml", ".yaml") and p.is_file())
+
+    def read(p):
+        try:
+            return p.read_text()
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    stems, jobs = set(), set()
+    for d in forge:
+        for p in workflows(d):
+            stems.add(p.stem)
+            jobs |= job_names(read(p))
+    findings = []
+    for p in workflows(gh):
+        text = read(p)
+        mine = job_names(text)
+        if p.stem in stems or (mine and mine <= jobs) or LJV013_OPT_OUT.search(text):
+            continue
+        loc = rel(p, root)
+        findings.append(Finding(
+            "lessons", "MEDIUM", "LJV-013",
+            f"{loc} never runs on Forgejo (no .forgejo/workflows counterpart)", loc,
+            LJV013_MESSAGE.format(f=loc)))
+    return findings
+
+
+# LJV-015 (CNVYR-555). CNVYR-548 found secrets reachable from pull_request runs: on
+# Forgejo a same-repo PR runs its own copy of the workflow, so any writer can edit a
+# step and print the secret. Shown in every repo's scan until CNVYR-550 narrows them.
+# A Python check beside LJV-013 (the YAML structure, not one line, decides it); no
+# YAML lib, scan.py is stdlib-only and CI has no pip, so the parse is line-based.
+LJV015_DOCS = ("https://docs.lukejv.com/architecture/anti-patterns/"
+               "#ljv-015-a-secret-in-a-job-that-runs-on-pull_request")
+LJV015_OPT_OUT = re.compile(r"#[ \t]*ljv-015:[ \t]*\S", re.I)
+LJV015_HEAD = re.compile(r"\bref:.*(pull_request\.head\.|head_ref|refs/pull/)")
+LJV015_SAFE = {"GITHUB_TOKEN", "FORGEJO_TOKEN"}
+LJV015_MESSAGE = (
+    "Job `{job}` in {f} runs on a pull request and receives {names}. On Forgejo a same-repo "
+    "PR runs its own copy of this workflow, so anyone with write access can edit a step and "
+    "print the secret (CNVYR-548).\n\n"
+    "Move the secret out of the PR path (a push/dispatch-only job, or a smaller token: "
+    "CNVYR-550), or, if the exposure is accepted, add the line `# ljv-015: <reason>` on the "
+    "job line or the line above it.\n\n"
+    "Docs: " + LJV015_DOCS)
+
+
+def workflow_events(lines):
+    """Event names under a workflow's top-level `on:`, in the string, list, map or flow
+    form. ponytail: an inline map also yields its nested keys (a branch named like an
+    event would count)."""
+    for i, line in enumerate(lines):
+        m = re.match(r"[\"']?on[\"']?:[ \t]*(.*)", line)
+        if m:
+            break
+    else:
+        return set()
+    inline = re.split(r"[ \t]#", m.group(1))[0]
+    if inline.strip():
+        return set(re.findall(r"[\w-]+", inline))
+    events, indent = set(), None
+    for line in lines[i + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace() and not line.startswith("-"):
+            break
+        here = len(line) - len(line.lstrip())
+        indent = here if indent is None else indent
+        m = here == indent and re.match(r"\s*(?:-\s+)?[\"']?([\w-]+)", line)
+        if m:
+            events.add(m.group(1))
+    return events
+
+
+def workflow_jobs(lines):
+    """[(name, line index, body lines)] for each job under the top-level `jobs:`.
+    Comment and blank lines are left out of the body."""
+    jobs, indent, in_jobs = [], None, False
+    for n, line in enumerate(lines):
+        if re.match(r"jobs:[ \t]*(#.*)?$", line):
+            in_jobs = True
+        elif not in_jobs or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        elif not line[0].isspace():
+            break
+        else:
+            here = len(line) - len(line.lstrip())
+            indent = here if indent is None else indent
+            m = here == indent and re.match(r"\s+[\"']?([\w-]+)[\"']?:", line)
+            if m:
+                jobs.append((m.group(1), n, []))
+            elif jobs:
+                jobs[-1][2].append(line)
+    return jobs
+
+
+def pr_secret_workflows(root):
+    """LJV-015 findings: each job of a .forgejo/.gitea workflow that runs on
+    `pull_request` (or `pull_request_target` with a checkout of the PR head) and
+    references `secrets.<NAME>` other than GITHUB_TOKEN/FORGEJO_TOKEN in its env,
+    `with` or `run`. Opt out per job with `# ljv-015: <reason>` on the job line or the
+    line above. ponytail: a workflow-level `env:` secret is not read (LJV-008 reads it)."""
+    root = Path(root)
+    findings = []
+    for sub in (".forgejo", ".gitea"):
+        d = root / sub / "workflows"
+        if not d.is_dir():
+            continue
+        for p in sorted(x for x in d.iterdir() if x.suffix in (".yml", ".yaml") and x.is_file()):
+            try:
+                lines = p.read_text().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            events = workflow_events(lines)
+            for job, n, body in workflow_jobs(lines):
+                head = any(LJV015_HEAD.search(l) for l in body)
+                if "pull_request" not in events and not (
+                        "pull_request_target" in events and head):
+                    continue
+                if LJV015_OPT_OUT.search(lines[n]) or (n and LJV015_OPT_OUT.search(lines[n - 1])):
+                    continue
+                secrets = sorted({s for l in body if not re.match(r"\s*(?:-\s+)?if:", l)
+                                  for s in re.findall(r"\bsecrets(?:\.|\[\s*['\"])(\w+)", l)} - LJV015_SAFE)
+                if not secrets:
+                    continue
+                loc = rel(p, root)
+                findings.append(Finding(
+                    "lessons", "MEDIUM", "LJV-015",
+                    f"{loc}: job {job} runs on a pull request and receives a secret", loc,
+                    LJV015_MESSAGE.format(job=job, f=loc,
+                                          names=", ".join(f"secrets.{s}" for s in secrets))))
+    return findings
+
+
 def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
     """(findings, note, not_scanned): not_scanned is [(reason, path)], the
     files opengrep timed out on ("timeout") or dropped for size ("size"). They
@@ -1837,7 +2021,9 @@ def main():
         if "lessons" in layers:
             r = guarded("lessons", scan_sast, tools, root, out, diff_ref, lesson_cfg, "lessons")
             f, n, skipped = r if r else ([], "the lessons layer did NOT run", [])
-            findings += f
+            # LJV-013/015 are whole-tree only: --diff cannot say which findings are new.
+            findings += f + ([] if diff_ref else
+                             github_only_workflows(root) + pr_secret_workflows(root))
             notes["lessons"] = n
             unscanned += [("lessons", *s) for s in skipped]
 
