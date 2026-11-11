@@ -7694,9 +7694,11 @@ rules:
   - metavariable-regex:
       metavariable: $MODE
       # Octal: world-writable (last digit 2,3,6,7) or setuid/setgid (leading digit 2-7 of four).
+      # 1777 (sticky, the /tmp idiom) is exempt. A bare `+w` is too: with no class it is masked by
+      # the umask, so it adds u+w only.
       # Symbolic: `s` for anyone, `w` only when the class holds o or a (`u+w` is fine); a comma list
       # is checked clause by clause.
-      regex: ^(?:[0-7]?[0-7][0-7][2367]|[2-7][0-7]{3}|(?:[^,]*,)*(?:[ugoa]*[+=][rwxXt]*s[rwxXst]*|[ugoa]*[oa][ugoa]*[+=][rwxXst]*w[rwxXst]*)(?:,.*)?)$
+      regex: ^(?!0?1777$)(?:[0-7]?[0-7][0-7][2367]|[2-7][0-7]{3}|(?:[^,]*,)*(?:[ugoa]*[+=][rwxXt]*s[rwxXst]*|[ugoa]*[oa][ugoa]*[+=][rwxXst]*w[rwxXst]*)(?:,.*)?)$
 - id: lukejv_sh_tls_rule-curl-wget-no-verify
   languages:
   - bash
@@ -7742,7 +7744,10 @@ rules:
   - pattern: $CMD ...
   # Each alternative starts at the thing itself (the option, `mysql`, `echo`), so it also
   # fires inside a quoted remote command (`ssh host "mysql -p'$PW' …"`). A secret echoed into a
-  # pipe or a file (`echo "$PW" | docker login --password-stdin`) is the safe idiom, not a hit;
+  # stdin-reading pipe (`echo "$PW" | docker login --password-stdin`) or a redirect of stdout to a
+  # file (`> f`, `>> f`; echo is a builtin, so it never reaches argv or a log) is the safe idiom,
+  # not a hit. Whatever still prints or reaches another process (`| tee x`, `2>&1`, `|| exit 1`)
+  # is. The redirect/pipe must sit in the echo's own command, before any `;`, `&` or `|`;
   # the variable's NAME must end in the secret word, so `$VAULT_PASSWORD_FILE` is not one.
   - pattern-regex: >-
-      (?i)(?:--(?:password|passwd|token|secret|api-?key|client-secret)(?:=|\s+)["']?\$|\bmysql(?:dump)?\b[^#\n]*?\s-p["']?\$|\b(?:echo|printf)[ \t]+[^#\n|>]*?\$\{?\w*?(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_KEY)\}?(?!\w)(?![^\n]*[|>]))
+      (?i)(?:--(?:password|passwd|token|secret|api-?key|client-secret)(?:=|\s+)["']?\$|\bmysql(?:dump)?\b[^#\n]*?\s-p["']?\$|\b(?:echo|printf)[ \t]+[^#\n|>]*?\$\{?\w*?(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_KEY)\}?(?!\w)(?![^\n;&|]*(?:(?<![\d&])>(?!&)|\|(?!\|)[^\n]*(?:stdin|--with-token))))
