@@ -335,6 +335,27 @@ def gaps(reviews, issue_comments):
     return ""
 
 
+def stale_review(repo, pr, reviews, issue_comments, head):
+    """CNVYR-1306: "review ran on abc1234, head is def5678" when the latest run
+    read an older commit AND a file of this PR changed since, else "". A push
+    that leaves the PR's files alone (a merge of main) is skipped by main() with
+    no new marker, so it is not flagged: it would stay red for good. A sha that
+    cannot be compared (a force-push dropped it) is stale, never clean. Same
+    rule as assistant scripts/review-findings.ts staleReview(): change one, change both.
+    Raises RuntimeError on an unreadable PR file list, like get_all."""
+    run = next(runs(reviews, issue_comments), None)
+    sha = run[0][2] if run and len(run[0]) >= 3 else ""  # fallback and pre-CNVYR-469 markers have none
+    if not sha or head.lower().startswith(sha.lower()):
+        return ""
+    msg = f"review ran on {sha[:7]}, head is {head[:7]}"
+    cmp = api("GET", f"/repos/{repo}/compare/{sha}...{head}")
+    if not isinstance(cmp, dict) or not isinstance(cmp.get("files"), list):
+        return msg
+    changed = {f.get("filename") for f in cmp["files"]}
+    hit = sum(f.get("filename") in changed for f in get_all(f"/repos/{repo}/pulls/{pr}/files"))
+    return f"{msg} ({hit} file(s) changed since)" if hit else ""
+
+
 def baseline(reviews, issue_comments):
     """(head sha, files it left unreviewed) of the latest run that tracked
     every finding, or (None, set()). A push is reviewed against it — what
@@ -497,23 +518,40 @@ moved, the other implementations of an interface, the tests that cover it, the
 comments and docs that describe it. Most real defects are only visible from
 outside the hunk.
 
-WHAT NOT TO REPORT. Three kinds of finding have each cost an author a round to
-answer "not a defect", so leave them out:
+WHAT NOT TO REPORT AS FACT. Two kinds of claim have each cost an author a round
+to answer "not a defect", because the reviewer could not see what decides them.
+Do not assert either one; the third kind is simply left out.
 
   * A DEPENDENCY'S WORK. A PR can wait on another that changes files, paths,
     namespaces or symbols this one refers to. Do not report one as missing, or as
     still in its old place, when a PR under "Depends on" below could be what adds
-    or moves it, and do not review that PR's changes here.
+    or moves it, and do not review that PR's changes here. The same goes for a
+    consequence you work out from the checkout's CURRENT copy of something that
+    PR changes ("the probe stops counting these routes", "the old definition is
+    still there"): that PR may already have changed it. Where the claim hinges
+    on what that PR does, it is a `Verify:` finding (below), not a defect.
   * GUESSES ABOUT WHAT IS OUTSIDE THE CHECKOUT. You have no network, cluster or
-    registry. "May not exist", "likely missing", "unverified", said of a live
-    system, a published version, a third-party default or a figure you cannot
-    read here, is not a finding: look for the fact with Read and Grep, and if
-    the checkout does not contradict the claim, drop it. A title says what is
-    wrong, never what might be.
+    registry. A claim about a live system (cluster, node, running service,
+    metrics), another repository, a branch-protection or other forge setting, a
+    board or card state, a published version, a third-party default or a figure
+    you cannot read here is a thing you have not seen. Look for the fact with Read
+    and Grep first. If the checkout contradicts the claim, or the diff contradicts
+    itself, report it as an ordinary finding at the severity it deserves. If it
+    does not, you cannot say the claim is wrong, so write it as a `Verify:`
+    finding (below) or drop it. Never write "may not exist" or "likely missing"
+    as a defect.
   * A CHOICE THE AUTHOR ALREADY OWNS. If a comment beside the code, or the
     "Not proven" text below, says a choice is deliberate, accepted or held for
     later (by design, intentional, trade-off, holds until), report it only when
     the code breaks the reason given or its stated limit. Not the choice.
+
+A `Verify:` FINDING is how you raise something that depends on state you cannot
+see: severity "low", the title starts with "Verify:" and names what to check, and
+the body gives the one command that settles it (kubectl, curl, tea or gh api, or
+a grep in the other repository) plus what the answer would change. Use it only
+when the problem hinges on that outside state. It is not a way to soften a
+defect you can see: a bug visible in the diff or the checkout keeps its real
+severity even if live state is also involved, and a live system never lowers it.
 
 Sweep these, in this order, and record what each one found in `checked`:
 
@@ -815,7 +853,9 @@ def publish_status(repo, pr, head, hold="", unreviewed=()):
         reviews = get_all(f"/repos/{repo}/pulls/{pr}/reviews")
         issue_comments = get_all(f"/repos/{repo}/issues/{pr}/comments")
         found = findings_state(review_comments(repo, pr, reviews), issue_comments)
-        state, desc = describe(found, gaps(reviews, issue_comments))
+        state, desc = describe(found, "; ".join(t for t in (
+            stale_review(repo, pr, reviews, issue_comments, head),
+            gaps(reviews, issue_comments)) if t))
         if hold:
             opened = [i for i, f in found.items() if f["state"] == "open"]
             state = "pending"

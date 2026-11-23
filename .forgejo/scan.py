@@ -342,13 +342,23 @@ def canary_lessons(tools, tmp):
         want |= marks["ruleid"]
         ok |= marks["ok"]
     out = tmp / "lessons.json"
-    run([tools["opengrep"], "scan", "--config", str(LESSONS), "--quiet",
-         "--json", "--output", str(out), str(fx)])
+    rc, _, err = run([tools["opengrep"], "scan", "--config", str(LESSONS), "--quiet",
+                      "--json", "--output", str(out), str(fx)])
+    doc = load_json(out)
     got = {(Path(x.get("path", "")).stem, (x.get("start") or {}).get("line"),
             (x.get("check_id") or "?").split(".")[-1])
-           for x in lst(load_json(out), "results")}
+           for x in lst(doc, "results")}
     for s, n, r in sorted(want - got):
         problems.append(f"lesson {r} missed its positive at {s}.fixture:{n}")
+    if want - got:
+        # CNVYR-742: a miss on every line that passed on rerun. Name the cause
+        # (timeout, crash, parse error) instead of hiding it; never retry.
+        for e in lst(doc, "errors"):
+            t = e.get("type")
+            problems.append("opengrep error: %s: %s" % (
+                t[0] if isinstance(t, list) and t else t,
+                (e.get("message") or "")[:300]))
+        problems.append(f"opengrep exit {rc}, stderr tail: " + (err.strip()[-500:] or "(empty)"))
     for s, n, r in sorted(ok & got):
         problems.append(f"lesson {r} matched its negative at {s}.fixture:{n}")
     return problems
@@ -1388,6 +1398,88 @@ def scan_sast(tools, root, out, diff_ref, config=RULES, layer="sast"):
                             + [("size", p) for p in sast_oversize(doc, root)])
 
 
+# SCAN-386 (SCAN-137): `sast: ran, 0 findings` on a Rust tree means "no rule looked".
+# This names the languages in the tree that no loaded rule lists. A note, never a
+# failure, and not in `notes` (a note there reads as "the layer covered nothing").
+# ponytail: extension table only, no shebang detection (the design review's call);
+# a script with no extension is invisible here. Add a row per language a rule
+# author starts caring about. Each row was probed against opengrep 1.30.0 (a rule
+# in that language scans exactly these extensions): .mts/.cts are NOT scanned.
+SAST_EXT = {
+    ".py": "python", ".pyi": "python", ".js": "javascript", ".jsx": "javascript",
+    ".mjs": "javascript", ".cjs": "javascript", ".ts": "typescript", ".tsx": "typescript",
+    ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin", ".kts": "kotlin",
+    ".scala": "scala", ".rb": "ruby", ".php": "php", ".cs": "csharp", ".swift": "swift",
+    ".c": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".hpp": "cpp",
+    ".sh": "bash", ".bash": "bash", ".lua": "lua", ".ml": "ocaml", ".dart": "dart",
+    ".ex": "elixir", ".exs": "elixir", ".jl": "julia", ".clj": "clojure", ".sol": "solidity",
+}
+SAST_ALSO = {"typescript": "javascript"}   # a javascript rule also scans .ts/.tsx
+SAST_PROBE = """rules:
+- id: probe
+  languages: [regex]
+  message: probe
+  severity: INFO
+  pattern-regex: ZZZ-never-matches-ZZZ
+"""
+
+
+def rule_languages(config):
+    """(names, keys): the union of `languages:` entries across a rules file, and how
+    many `languages:` keys yielded any. A line reader over the block form the file
+    uses (`languages:` then `- name` lines): scan.py has no YAML parser. A key in
+    another form (`languages: [a]`) yields nothing, so keys falls below the count of
+    `languages:` lines, which test_sast_coverage.py fails on."""
+    names, keys, state = set(), 0, 0        # state: 1 just after `languages:`, 2 in its list
+    for line in Path(config).read_text().splitlines():
+        s = line.strip()
+        m = re.fullmatch(r"-\s+['\"]?([\w-]+)['\"]?", s)
+        if state and m:
+            names.add(m[1])
+            keys += state == 1
+            state = 2
+        else:
+            state = 1 if s == "languages:" else 0
+    return names, keys
+
+
+def sast_uncovered(files, covered):
+    """[(language, count)] for the files whose language no rule in `covered` lists,
+    most files first. `generic`/`regex` rules cover nothing here: only a name in
+    SAST_EXT can be a language."""
+    n = {}
+    for f in files:
+        lang = SAST_EXT.get(Path(f).suffix.lower())
+        if lang and not {lang, SAST_ALSO.get(lang)} & covered:
+            n[lang] = n.get(lang, 0) + 1
+    return sorted(n.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
+def sast_gaps(tools, root, tmp, diff_ref, config=RULES):
+    """The note line for the sast layer, or None when there is nothing to say or
+    opengrep cannot say. The files are the ones opengrep itself scans: a regex rule
+    that never matches targets every file after .gitignore, .semgrepignore, its
+    default ignores (node_modules, vendor, test/...) and the size limit, and its JSON
+    lists them in `paths.scanned`. With --diff, only files the change touched."""
+    probe = Path(tmp) / "probe.yml"
+    probe.write_text(SAST_PROBE)
+    out = Path(tmp) / "probe.json"
+    run([tools["opengrep"], "scan", "--config", str(probe), "--json", "--output", str(out),
+         str(root)])
+    doc = load_json(out)
+    if "paths" not in doc:
+        raise RuntimeError("opengrep's probe run gave no file list")
+    files = [rel(p, root) for p in lst(doc["paths"], "scanned")]
+    if diff_ref:
+        touched = touched_paths(root, diff_ref)
+        if touched is None:
+            raise RuntimeError("git could not list the changed files")
+        files = [f for f in files if (Path(root) / f).resolve() in touched]
+    gaps = sast_uncovered(files, rule_languages(config)[0])
+    return ("sast: not covered by any rule: "
+            + ", ".join(f"{l} ({n} file{'s' * (n > 1)})" for l, n in gaps)) if gaps else None
+
+
 # --------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------
@@ -1936,6 +2028,16 @@ def main():
         sys.stderr.write("\nInstall them, or narrow the run with --only.\n")
         return 2
 
+    # A stale local betterleaks counts secrets differently from CI (SCAN-251).
+    # Warn only; betterleaks alone, the other tools have not drifted.
+    if "betterleaks" in tools:
+        _, out, err = run([tools["betterleaks"], "version"])
+        m = re.search(r"\d+\.\d+\.\d+", out + err)   # "v1.8.1" and "betterleaks version 1.8.1" are the pin too
+        have = m.group(0) if m else ""
+        if have and have != VERSIONS["betterleaks"]:
+            sys.stderr.write(f"warning: betterleaks {have} found, CI pins "
+                             f"{VERSIONS['betterleaks']}; counts may differ from CI.\n")
+
     diff_ref = args.diff
     if diff_ref:
         rc, _, _ = run(["git", "-C", str(root), "rev-parse", "--verify",
@@ -1960,6 +2062,7 @@ def main():
             broken.append(layer)
             return None
     unscanned = []          # (layer, "timeout"|"size", path) opengrep skipped (CNVYR-530/531)
+    sast_gap = None         # SCAN-386: the "not covered by any rule" line, console never sees it
     nothing_to_check = False
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out.json"
@@ -2018,6 +2121,12 @@ def main():
             findings += f
             notes["sast"] = n
             unscanned += [("sast", *s) for s in skipped]
+            if r and not n:         # only when the layer ran: a skipped run is not coverage info
+                try:
+                    sast_gap = sast_gaps(tools, root, tmp, diff_ref)
+                except Exception as e:      # a note: it never changes the verdict
+                    sys.stderr.write("warning: sast: could not list uncovered languages "
+                                     f"({redact(f'{type(e).__name__}: {e}')})\n")
         if "lessons" in layers:
             r = guarded("lessons", scan_sast, tools, root, out, diff_ref, lesson_cfg, "lessons")
             f, n, skipped = r if r else ([], "the lessons layer did NOT run", [])
@@ -2035,6 +2144,8 @@ def main():
         print()
         for layer, why, p in unscanned:
             print(f"{layer}: not scanned ({why}): {redact(p)}")
+    if sast_gap:
+        print(f"\n{sast_gap}")
 
     # ---- the gate ---------------------------------------------------------
     # Whole-tree runs gate NARROWLY. Secrets are binary, so any hit fails.

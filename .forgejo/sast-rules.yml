@@ -19,7 +19,7 @@
 # `lukejv_*`) are our own, written from scratch for this file — MIT, copyright
 # lukejv-dev. Never copy one in from semgrep-rules (below) or from
 # opengrep/opengrep-rules (archived, stale). Each has a positive and a negative
-# fixture in ops/forgejo-ci/tests/sast-js/ (or sast-bash/), checked by test_sast_rules.py.
+# fixture in ops/forgejo-ci/tests/sast-js/ (or sast-bash/, sast-rust/), checked by test_sast_rules.py.
 #
 # NOT semgrep's own `semgrep-rules` repo, and never vendor that one: it ships
 # under the Semgrep Rules License v1.0, which forbids redistribution outright.
@@ -33,14 +33,14 @@
 #   key, dropping duplicate ids, then append EVERYTHING below the
 #   `lukejv-dev rules` marker unchanged — it is not upstream and a regenerate
 #   that drops it silently blinds the TypeScript/JavaScript layer again.
-#   147 rules: 128 upstream (16 of them mode: taint) + 19 own.
+#   152 rules: 128 upstream (16 of them mode: taint) + 24 own.
 #
 # Coverage gap worth knowing: upstream has NO rust and NO typescript rules, and
 # its 11 javascript ones miss command injection, string-built SQL and disabled
 # TLS. The own rules cover those (typescript + javascript, SCAN-132); six more cover
-# bash (SCAN-134: eval, piped installers, rm -rf, chmod, curl -k, secrets on a command line); Rust
-# (lattice, asset-library) is uncovered by this layer entirely. One own rule is
-# k8s YAML: a LoadBalancer Service that opens NodePorts (HLP-472).
+# bash (SCAN-134: eval, piped installers, rm -rf, chmod, curl -k, secrets on a command line); five
+# cover Rust (SCAN-387: shell -c, string-built SQL, disabled TLS, JWT checks off, transmute and
+# from_raw_parts). One own rule is k8s YAML: a LoadBalancer Service that opens NodePorts (HLP-472).
 rules:
 - id: csharp_cookies_rule-CookieWithoutHttpOnlyFlag
   languages:
@@ -7751,3 +7751,161 @@ rules:
   # the variable's NAME must end in the secret word, so `$VAULT_PASSWORD_FILE` is not one.
   - pattern-regex: >-
       (?i)(?:--(?:password|passwd|token|secret|api-?key|client-secret)(?:=|\s+)["']?\$|\bmysql(?:dump)?\b[^#\n]*?\s-p["']?\$|\b(?:echo|printf)[ \t]+[^#\n|>]*?\$\{?\w*?(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_KEY)\}?(?!\w)(?![^\n;&|]*(?:(?<![\d&])>(?!&)|\|(?!\|)[^\n]*(?:stdin|--with-token))))
+# rust (SCAN-387). Upstream has none. The id carries its kind: `_cmdi_`, `_sqli_`, `_tls_` and
+# `_jwt_` are ERROR, `_unsafe_` is WARNING (test_sast_rules.py checks the mapping). opengrep
+# matches a turbofish (`query_as::<_, T>(…)`) only with the exact number of type arguments, so
+# the sqli sink and the transmute pattern list the arities seen in practice.
+- id: lukejv_rust_cmdi_rule-shell-dash-c-non-literal
+  languages:
+  - rust
+  severity: ERROR
+  message: |
+    A shell is started with `-c` (`/C` for cmd) and the script it runs is not a literal. Anything
+    interpolated into it (a branch name, a path, a request field) can add `; rm -rf ~`.
+    Skip the shell: `Command::new("git").arg("log").arg(branch)` passes each value as one
+    argument, with nothing to parse. If a shell is needed, pass the value as `$1` of a literal script.
+  metadata:
+    cwe: CWE-78
+    category: security
+    shortDescription: OS command injection via a shell -c script
+    security-severity: High
+  patterns:
+  - pattern-either:
+    - pattern: Command::new($SH).arg($FLAG).arg($CMD)
+    - pattern: Command::new($SH).args([$FLAG, $CMD, ...])
+    - pattern: Command::new($SH).args(&[$FLAG, $CMD, ...])
+    - pattern: process::Command::new($SH).arg($FLAG).arg($CMD)
+    - pattern: process::Command::new($SH).args([$FLAG, $CMD, ...])
+    - pattern: process::Command::new($SH).args(&[$FLAG, $CMD, ...])
+    - pattern: $M::process::Command::new($SH).arg($FLAG).arg($CMD)
+    - pattern: $M::process::Command::new($SH).args([$FLAG, $CMD, ...])
+    - pattern: $M::process::Command::new($SH).args(&[$FLAG, $CMD, ...])
+  - metavariable-regex:
+      metavariable: $SH
+      regex: ^"(?:(?:/(?:usr/)?bin/)?(?:sh|bash|zsh|dash|ash)|cmd(?:\.exe)?)"$
+  - metavariable-regex:
+      metavariable: $FLAG
+      regex: ^"(?:-[A-Za-z]*c[A-Za-z]*|/[cC])"$
+  # A string literal ("…", r"…", r#"…"#) is the one safe form: the author wrote the whole script.
+  # The argument must be exactly one literal: `"git log ".to_string() + branch` starts with one and is not.
+  - metavariable-regex:
+      metavariable: $CMD
+      regex: ^(?!(?:"(?:[^"\\]|\\.)*"|r(#*)"[\s\S]*?"\1)$)
+- id: lukejv_rust_sqli_rule-query-built-from-strings
+  languages:
+  - rust
+  mode: taint
+  severity: ERROR
+  message: |
+    A SQL string built with `format!` (or `String + &str`) reaches query(), execute(),
+    query_as() or sql_query(). Anything interpolated into it (an id, a name, a filter) becomes SQL:
+    `x = '1' OR '1'='1'`. Write the statement once with placeholders and bind the values:
+    `sqlx::query("… WHERE id = $1").bind(id)`, `conn.execute("… WHERE id = ?1", [id])`.
+    A table or column name cannot be bound: check it against a fixed list instead.
+  metadata:
+    cwe: CWE-89
+    category: security
+    shortDescription: SQL injection via a string-built query
+    security-severity: High
+  pattern-sources:
+  - patterns:
+    - pattern: format!($FMT, ...)
+    # A `{` that is not the `{{` escape: `{}`, `{0}`, `{name}`, `{:?}`. A format! with none is a constant.
+    # A plain string may hold `\"` before the placeholder (`"SELECT * FROM \"{}\""`); a raw one has no escapes and may hold a bare `"` (the metavariable is only the format string, so `[\s\S]` cannot run past it).
+    - metavariable-regex:
+        metavariable: $FMT
+        regex: ^(?:r#*"[\s\S]*?|"(?:[^"\\]|\\.)*?)(?<!\{)\{(?!\{)
+  - pattern: '"...".to_string() + $X'
+  - pattern: '"...".to_owned() + $X'
+  - pattern: String::from("...") + $X
+  pattern-sinks:
+  - patterns:
+    - pattern-either:
+      - pattern: $F($SQL, ...)
+      - pattern: $O.$F($SQL, ...)
+      - pattern: $F::<$A>($SQL, ...)
+      - pattern: $F::<$A, $B>($SQL, ...)
+      - pattern: $P::$F::<$A>($SQL, ...)
+      - pattern: $P::$F::<$A, $B>($SQL, ...)
+      - pattern: $P::$F::<$A, $B, $C>($SQL, ...)
+    - metavariable-regex:
+        metavariable: $F
+        regex: ^(?:query|query_as|query_scalar|query_one|query_opt|query_row|execute|sql_query|prepare|batch_execute|execute_batch)$
+    - focus-metavariable: $SQL
+- id: lukejv_rust_tls_rule-certificate-verification-disabled
+  languages:
+  - rust
+  severity: ERROR
+  message: |
+    TLS certificate checking is switched off in code (`danger_accept_invalid_certs(true)`,
+    `danger_accept_invalid_hostnames(true)`, or a rustls `ServerCertVerifier` whose
+    verify_server_cert always returns Ok), so anyone on the path can impersonate the server.
+    Trust the right CA instead: `add_root_certificate(Certificate::from_pem(ca)?)`. A setting
+    the operator turns on, such as `danger_accept_invalid_certs(!cfg.verify_tls)`, is not flagged.
+  metadata:
+    cwe: CWE-295
+    category: security
+    shortDescription: TLS certificate verification disabled
+    security-severity: High
+  pattern-either:
+  - pattern: $B.danger_accept_invalid_certs(true)
+  - pattern: $B.danger_accept_invalid_hostnames(true)
+  - pattern: |
+      fn verify_server_cert(...) -> $R {
+        Ok(ServerCertVerified::assertion())
+      }
+  - pattern: |
+      fn verify_server_cert(...) -> $R {
+        return Ok(ServerCertVerified::assertion());
+      }
+- id: lukejv_rust_jwt_rule-validation-checks-off
+  languages:
+  - rust
+  severity: ERROR
+  message: |
+    A jsonwebtoken check is turned off: the signature (`insecure_disable_signature_validation`,
+    `dangerous_insecure_decode`, `dangerous_unsafe_decode`) or the expiry (`validate_exp = false`).
+    Without the signature check anyone can mint a token; without the expiry check a stolen
+    token works forever. Leave `Validation::new(alg)` as it is and set the audience and issuer.
+  metadata:
+    cwe: CWE-347
+    category: security
+    shortDescription: JWT signature or expiry validation disabled
+    security-severity: High
+  pattern-either:
+  - pattern: $V.insecure_disable_signature_validation()
+  - pattern: $F::dangerous_insecure_decode(...)
+  - pattern: $F::dangerous_insecure_decode::<$T>(...)
+  - pattern: $F::dangerous_unsafe_decode(...)
+  - pattern: $F::dangerous_unsafe_decode::<$T>(...)
+  # Both the assignment and the struct-literal field: opengrep cannot parse a struct pattern.
+  - pattern-regex: \bvalidate_exp\s*[:=]\s*false\b
+- id: lukejv_rust_unsafe_rule-transmute-or-from-raw-parts-outside-data
+  languages:
+  - rust
+  severity: WARNING
+  message: |
+    `transmute`, or `slice::from_raw_parts` on a pointer that is not taken from a slice or Vec
+    in scope, reinterprets memory whose layout and length this code did not check: a bad length
+    reads past the buffer, a bad value breaks an invariant (bool, enum, reference). Use
+    `u32::from_le_bytes`, `bytemuck::try_from_bytes`, or `slice::from_raw_parts` only on `v.as_ptr()`
+    with `v.len()`; check lengths of outside data before the unsafe block.
+  metadata:
+    cwe: CWE-119
+    category: security
+    shortDescription: transmute or from_raw_parts on outside data
+    security-severity: Medium
+  patterns:
+  - pattern-either:
+    - pattern: $F::transmute(...)
+    - pattern: $F::transmute::<$A, $B>(...)
+    - pattern: transmute::<$A, $B>(...)
+    - pattern: transmute(...)
+    - pattern: $F::from_raw_parts($PTR, ...)
+    - pattern: $F::from_raw_parts_mut($PTR, ...)
+  # A pointer taken from a slice, Vec or array in scope (`v.as_ptr()`, `v.as_mut_ptr() as *mut u8`)
+  # is our own memory; a bare variable or parameter is not.
+  - pattern-not: $F::from_raw_parts($X.as_ptr(), ...)
+  - pattern-not: $F::from_raw_parts($X.as_ptr() as $T, ...)
+  - pattern-not: $F::from_raw_parts_mut($X.as_mut_ptr(), ...)
+  - pattern-not: $F::from_raw_parts_mut($X.as_mut_ptr() as $T, ...)
