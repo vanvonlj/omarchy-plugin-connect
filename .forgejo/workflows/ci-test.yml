@@ -94,7 +94,7 @@ jobs:
       pg_password: ${{ steps.plan.outputs.pg_password }}
       pg_db: ${{ steps.plan.outputs.pg_db }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The base branch must be present to read the parser from it.
           fetch-depth: 0
@@ -143,7 +143,7 @@ jobs:
       # forgejo/*-artifact, not actions/*: @actions/artifact v2 refuses non-github.com servers.
       - name: Upload the tree
         if: steps.plan.outputs.enabled == 'true'
-        uses: forgejo/upload-artifact@v4
+        uses: forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
         with:
           name: src
           path: ${{ runner.temp }}/src/src.tgz
@@ -160,7 +160,7 @@ jobs:
       image: ${{ needs.plan.outputs.image }}
     steps:
       - name: Download the tree
-        uses: forgejo/download-artifact@v4
+        uses: forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
         # The artifact action needs ACTIONS_RUNTIME_TOKEN and nothing else.
         env:
           GITHUB_TOKEN: ""
@@ -210,7 +210,7 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - name: Download the tree
-        uses: forgejo/download-artifact@v4
+        uses: forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
         # The artifact action needs ACTIONS_RUNTIME_TOKEN and nothing else.
         env:
           GITHUB_TOKEN: ""

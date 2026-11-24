@@ -286,15 +286,25 @@ def api(method, path, payload=None):
 def get_all(path):
     """GET a list, every page. Raises instead of returning a partial list: the
     findings status is a merge signal, and a failed read must never turn into
-    "0 open"."""
-    out, page = [], 1
+    "0 open".
+
+    Forgejo's issue-comments list ignores limit and page: it answers every page
+    with the whole list. A PR with 50 or more comments therefore never returned a
+    short page, and this loop grew `out` until the job timeout killed it (exit
+    137, no output: #553 with 72 comments, 2026-11-24). A page that adds nothing
+    new is the end of the list."""
+    out, seen, page = [], set(), 1
     while True:
         sep = "&" if "?" in path else "?"
         batch = api("GET", f"{path}{sep}limit=50&page={page}")
         if batch is None:
             raise RuntimeError(f"GET {path} failed")
-        out += batch
-        if len(batch) < 50:
+        # Items without an id (not Forgejo's shape) cannot be told apart: keep
+        # them all, and rely on the short page to end the list as before.
+        fresh = [x for x in batch if not (isinstance(x, dict) and x.get("id") in seen)]
+        seen.update(x["id"] for x in fresh if isinstance(x, dict) and "id" in x)
+        out += fresh
+        if len(batch) < 50 or not fresh:
             return out
         page += 1
 
